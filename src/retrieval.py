@@ -43,21 +43,17 @@ class MultiViewCandidateRetriever:
         
         target_records: tid -> (norm_name, core_name, norm_addr, country)
         """
-        # Group by country
-        country_names = defaultdict(list)
-        country_addrs = defaultdict(list)
-        
-        for tid, (n_name, c_name, n_addr, country) in target_records.items():
+        # Index target IDs by country
+        self.country_target_ids = defaultdict(list)
+        for tid, (_, _, _, country) in target_records.items():
             c = country.strip() if country else "UNKNOWN"
             self.country_target_ids[c].append(tid)
-            country_names[c].append(n_name or " ")
-            country_addrs[c].append(n_addr or " ")
             
         for c, tids in self.country_target_ids.items():
             if len(tids) == 0:
                 continue
-            names = country_names[c]
-            addrs = country_addrs[c]
+            names = [target_records[tid][0] or " " for tid in tids]
+            addrs = [target_records[tid][2] or " " for tid in tids]
             
             if self.enable_tfidf_name:
                 v_name = TfidfVectorizer(max_features=50000, token_pattern=r"(?u)\b\w+\b", dtype=np.float32)
@@ -73,6 +69,9 @@ class MultiViewCandidateRetriever:
                 v_char = TfidfVectorizer(analyzer="char", ngram_range=(3, 3), max_features=40000, dtype=np.float32)
                 self.char_matrices[c] = v_char.fit_transform(names).tocsr()
                 self.char_vectorizers[c] = v_char
+                
+            names.clear()
+            addrs.clear()
 
     def retrieve_candidates(
         self,

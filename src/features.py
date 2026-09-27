@@ -125,6 +125,18 @@ class OptimizedEntity:
             self.postal_code = ac.get("postal_code", "")
             self.house_num = ac.get("house_num", "")
             self.digits_set = ac.get("digits", set())
+        elif self.norm_addr:
+            self.digits_set = self.addr_nums
+            self.house_num = ""
+            for t in self.norm_addr.split():
+                if t.isdigit():
+                    self.house_num = t
+                    break
+            self.postal_code = ""
+            for t in self.norm_addr.split():
+                if t.isdigit() and len(t) in (5, 6):
+                    self.postal_code = t
+                    break
         else:
             self.postal_code = ""
             self.house_num = ""

@@ -106,6 +106,7 @@ def run_test_inference(
     t0 = time.time()
     
     blocker = InvertedIndexBlocker(max_key_frequency=500, max_candidates_per_s1=200)
+    freq_tracker = CorpusFrequencyTracker()
     raw_targets: Dict[str, Tuple[str, str, str, str]] = {}
     total_targets = 0
     
@@ -128,6 +129,15 @@ def run_test_inference(
                 n_addr = normalize_business_address(addr) if addr else ""
                 
                 raw_targets[tid] = (n_name, c_name, n_addr, country)
+                
+                # Stream frequency statistics on the fly (zero intermediate lists)
+                if n_name:
+                    freq_tracker.name_counts[n_name] += 1
+                    for t in set(n_name.split()):
+                        freq_tracker.token_doc_counts[t] += 1
+                if n_addr:
+                    freq_tracker.addr_counts[n_addr] += 1
+                freq_tracker.total_docs += 1
                     
                 if country:
                     keys = blocker._extract_all_keys(n_name, c_name, n_addr, name)
@@ -164,28 +174,8 @@ def run_test_inference(
         retriever.fit_target_corpora(raw_targets)
         print(f"  TF-IDF matrices fitted in {time.time() - t_ret:.2f}s", flush=True)
 
-    print("  Precomputing target invariants, frequencies & structured primitives...", flush=True)
-    t_ac = time.time()
-    freq_tracker = CorpusFrequencyTracker()
-    all_tgt_names = [r[0] for r in raw_targets.values()]
-    all_tgt_addrs = [r[2] for r in raw_targets.values()]
-    freq_tracker.fit(all_tgt_names, all_tgt_addrs)
-    
-    target_lookup: Dict[str, OptimizedEntity] = {}
-    for tid, (n_name, c_name, n_addr, country) in raw_targets.items():
-        ac = extract_structured_address_components(n_addr) if n_addr else None
-        target_lookup[tid] = OptimizedEntity(
-            norm_name=n_name,
-            core_name=c_name,
-            norm_addr=n_addr,
-            country=country,
-            src_id=tid,
-            ac=ac,
-            freq_tracker=freq_tracker
-        )
-    raw_targets.clear()
+    print("  [✓] Memory-safe target indexing and frequency tracking ready (zero object bloat).", flush=True)
     gc.collect()
-    print(f"  Target precomputation complete in {time.time() - t_ac:.2f}s", flush=True)
 
     # -------------------------------------------------------------------------
     # 3. STREAM S1 IN CHUNKS & GENERATE PREDICTIONS
@@ -271,6 +261,22 @@ def run_test_inference(
             final_cands_dict = stage5_cands
             ret_evidence_dict = {}
                 
+        # Materialize OptimizedEntity ONLY for the candidate targets in this active chunk
+        chunk_tids = {tid for c_set in final_cands_dict.values() for tid in c_set}
+        chunk_target_objects: Dict[str, OptimizedEntity] = {}
+        for tid in chunk_tids:
+            tgt_tuple = raw_targets.get(tid)
+            if tgt_tuple:
+                chunk_target_objects[tid] = OptimizedEntity(
+                    norm_name=tgt_tuple[0],
+                    core_name=tgt_tuple[1],
+                    norm_addr=tgt_tuple[2],
+                    country=tgt_tuple[3],
+                    src_id=tid,
+                    ac=None,
+                    freq_tracker=freq_tracker
+                )
+
         feat_matrix_rows = []
         pair_meta = []
         
@@ -283,7 +289,7 @@ def run_test_inference(
             
             evid_map = ret_evidence_dict.get(s1_id, {})
             for tid in cand_set:
-                tgt_obj = target_lookup.get(tid)
+                tgt_obj = chunk_target_objects.get(tid)
                 if not tgt_obj:
                     continue
                 evid = evid_map.get(tid, {})
@@ -304,7 +310,7 @@ def run_test_inference(
             pair_probs=pair_prob_dict,
             candidate_sets=final_cands_dict,
             s1_objects=s1_objects,
-            target_lookup=target_lookup,
+            target_lookup=chunk_target_objects,
             s1_addr_comps=s1_addr_comps_chunk,
             tgt_addr_comps=None,
         )
@@ -336,6 +342,7 @@ def run_test_inference(
             print(f"    Chunk {chunk_idx:4d} | Processed: {total_s1_processed:8,d} S1s | Throughput: {rate:6.1f} S1/s | Elapsed: {elapsed:6.1f}s | Matches: {total_predicted_matches:8,d}", flush=True)
             f_match.flush()
             f_cand.flush()
+        chunk_target_objects.clear()
 
     with open(source1_file, "r", encoding="utf-8") as f:
         f.readline()  # Skip header
