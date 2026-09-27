@@ -10,7 +10,7 @@ from collections import defaultdict
 import polars as pl
 import numpy as np
 import lightgbm as lgb
-from rapidfuzz.distance import JaroWinkler
+from rapidfuzz.distance import JaroWinkler, LCSseq
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -36,97 +36,40 @@ from src.ranking import (
     extract_structured_address_components,
     compute_address_component_features,
 )
-from src.postprocess import PostProcessor
-
-V1_1_FEATURE_COLS = STAGE5_FEATURE_COLS + [
-    "addr_hnum_match", "addr_hnum_conflict", "addr_postal_match",
-    "addr_postal_conflict", "addr_digits_overlap", "addr_digits_conflict",
-    "s1_name_log_freq", "tgt_name_log_freq", "s1_addr_log_freq", "tgt_addr_log_freq",
-    "retrieval_views_count", "max_tfidf_score",
-    "name_jaro_winkler", "name_token_containment",
-    "addr_jaro_winkler", "addr_token_containment",
-    "name_weighted_jaccard", "addr_weighted_jaccard",
-    "cand_score_margin", "cand_pool_ambiguity",
-]
+from src.postprocess import SurgicalPostProcessorV1_3
+from scripts.push_to_98 import ULTRA_FEATURE_COLS, extract_ultra_features
 
 DELIM = "\t"
-
-def extract_v1_1_features(
-    s1: PrecomputedEntity,
-    tgt: PrecomputedEntity,
-    s1_ac: Dict[str, Any],
-    tgt_ac: Dict[str, Any],
-    freq_tracker: CorpusFrequencyTracker,
-    evid_map: Dict[str, float],
-) -> List[float]:
-    base = extract_pairwise_features_fast(s1, tgt)
-    ac_feats = compute_address_component_features(s1_ac, tgt_ac)
-    s1_nf = freq_tracker.get_name_freq_feature(s1.norm_name)
-    tgt_nf = freq_tracker.get_name_freq_feature(tgt.norm_name)
-    s1_af = freq_tracker.get_addr_freq_feature(s1.norm_addr)
-    tgt_af = freq_tracker.get_addr_freq_feature(tgt.norm_addr)
-    
-    ret_views = float(len(evid_map)) if evid_map else 1.0
-    max_tfidf = max([v for k, v in evid_map.items() if k != "blocking"], default=0.0)
-    
-    name_jw = JaroWinkler.similarity(s1.norm_name, tgt.norm_name)
-    addr_jw = JaroWinkler.similarity(s1.norm_addr, tgt.norm_addr) if (s1.norm_addr and tgt.norm_addr) else 0.0
-    
-    if s1.core_toks and tgt.core_toks:
-        name_containment = max(float(s1.core_toks.issubset(tgt.core_toks)), float(tgt.core_toks.issubset(s1.core_toks)))
-        inter = s1.core_toks.intersection(tgt.core_toks)
-        un = s1.core_toks.union(tgt.core_toks)
-        w_inter = sum(freq_tracker.get_token_idf(t) for t in inter)
-        w_un = sum(freq_tracker.get_token_idf(t) for t in un)
-        name_w_jaccard = float(w_inter / w_un) if w_un > 0 else 0.0
-    else:
-        name_containment = 0.0
-        name_w_jaccard = 0.0
-        
-    if s1.addr_toks and tgt.addr_toks:
-        addr_containment = max(float(s1.addr_toks.issubset(tgt.addr_toks)), float(tgt.addr_toks.issubset(s1.addr_toks)))
-        inter_a = s1.addr_toks.intersection(tgt.addr_toks)
-        un_a = s1.addr_toks.union(tgt.addr_toks)
-        w_inter_a = sum(freq_tracker.get_token_idf(t) for t in inter_a)
-        w_un_a = sum(freq_tracker.get_token_idf(t) for t in un_a)
-        addr_w_jaccard = float(w_inter_a / w_un_a) if w_un_a > 0 else 0.0
-    else:
-        addr_containment = 0.0
-        addr_w_jaccard = 0.0
-        
-    return base + [
-        ac_feats["addr_hnum_match"], ac_feats["addr_hnum_conflict"],
-        ac_feats["addr_postal_match"], ac_feats["addr_postal_conflict"],
-        ac_feats["addr_digits_overlap"], ac_feats["addr_digits_conflict"],
-        s1_nf, tgt_nf, s1_af, tgt_af,
-        ret_views, max_tfidf,
-        name_jw, name_containment,
-        addr_jw, addr_containment,
-        name_w_jaccard, addr_w_jaccard,
-        0.0, 1.0,  # default margin and ambiguity placeholders
-    ]
 
 def run_test_inference(
     test_dir: str = "dataset/test",
     output_dir: str = "outputs",
-    model_path: str = "models/lightgbm_v1_1_optimized.txt",
-    threshold: float = 0.950,
+    model_path: str = "models/lightgbm_v1_1_ultra.txt",
+    threshold: float = 0.965,
+    s_guard: float = 0.900,
+    min_margin: float = 0.020,
+    joint_sim_floor: float = 0.450,
     chunk_size: int = 5000,
     max_s1: Optional[int] = None,
     enable_tfidf: bool = True,
     enable_global_consistency: bool = True,
 ):
-    print("=" * 75, flush=True)
-    print("PRODUCTION TEST INFERENCE PIPELINE (V1.1 FINAL) — AMAZON ML CHALLENGE 2026", flush=True)
+    print("=" * 80, flush=True)
+    print("PRODUCTION TEST INFERENCE PIPELINE (V1.3 SURGICAL) — AMAZON ML CHALLENGE 2026", flush=True)
+    print("=" * 80, flush=True)
     print(f"  Test Directory:         {test_dir}", flush=True)
     print(f"  Output Directory:       {output_dir}", flush=True)
     print(f"  Model Artifact:         {model_path}", flush=True)
-    print(f"  Decision Threshold:     {threshold:.3f}", flush=True)
+    print(f"  Base Threshold:         {threshold:.3f}", flush=True)
+    print(f"  Singleton Guard:        {s_guard:.3f}", flush=True)
+    print(f"  Minimum Margin:         {min_margin:.3f}", flush=True)
+    print(f"  Joint Sim Floor:        {joint_sim_floor:.3f}", flush=True)
+    print(f"  Feature Dimensions:     {len(ULTRA_FEATURE_COLS)} features", flush=True)
     print(f"  Chunk Size:             {chunk_size:,} S1 records", flush=True)
     print(f"  Max S1 Entities:        {'ALL' if max_s1 is None else f'{max_s1:,}'}", flush=True)
-    print(f"  Multi-View TF-IDF:      {enable_tfidf}", flush=True)
+    print(f"  Multi-View TF-IDF:      {enable_tfidf} (Top-45 per view, capacity 200)", flush=True)
     print(f"  Global Consistency:     {enable_global_consistency}", flush=True)
-    print("=" * 75, flush=True)
+    print("=" * 80, flush=True)
     
     t_global_start = time.time()
     os.makedirs(output_dir, exist_ok=True)
@@ -136,19 +79,33 @@ def run_test_inference(
     source2_file = test_path / "test_source2.tsv"
     source3_file = test_path / "test_source3.tsv"
     
-    # 1. Load Trained LightGBM Model
-    print("\n1. Loading Trained LightGBM Model...", flush=True)
+    # -------------------------------------------------------------------------
+    # 1. LOAD TRAINED LIGHTGBM MODEL & PRODUCTION SELF-CHECK
+    # -------------------------------------------------------------------------
+    print("\n1. Loading Trained LightGBM Model & Running Self-Check...", flush=True)
     if not os.path.isfile(model_path):
-        raise FileNotFoundError(f"Model file not found at: {model_path}")
+        raise FileNotFoundError(f"V1.3 Model file not found at: {model_path}")
+    
     model = lgb.Booster(model_file=str(model_path))
     model_features = model.feature_name()
-    print(f"  Loaded model successfully with {len(model_features)} features verified.", flush=True)
+    print(f"  Loaded model successfully with {len(model_features)} features.", flush=True)
     
-    # 2. Stream & Index Target Records (Source 2 & Source 3)
+    # Strict Self-Check Assertions
+    if len(model_features) != len(ULTRA_FEATURE_COLS):
+        raise ValueError(
+            f"Model feature count mismatch: expected {len(ULTRA_FEATURE_COLS)} (V1.3 Ultra), "
+            f"but found {len(model_features)} in '{model_path}'. "
+            f"Ensure models/lightgbm_v1_1_ultra.txt is used!"
+        )
+    print("  [✓] V1.3 Feature schema verified against production config.", flush=True)
+    
+    # -------------------------------------------------------------------------
+    # 2. STREAM & INDEX TARGET RECORDS (SOURCE 2 & SOURCE 3)
+    # -------------------------------------------------------------------------
     print("\n2. Streaming & Indexing Target Records (Source 2 + Source 3)...", flush=True)
     t0 = time.time()
     
-    blocker = InvertedIndexBlocker(max_key_frequency=500, max_candidates_per_s1=160)
+    blocker = InvertedIndexBlocker(max_key_frequency=500, max_candidates_per_s1=200)
     target_lookup_fast: Dict[str, PrecomputedEntity] = {}
     target_lookup_raw: Dict[str, Tuple[str, str, str, str]] = {}
     total_targets = 0
@@ -194,25 +151,25 @@ def run_test_inference(
     print("  Pruning high-frequency blocking keys...", flush=True)
     blocker.prune_high_frequency_keys()
     
-    # Fit Multi-View TF-IDF Retriever
+    # Fit Multi-View TF-IDF Retriever (V1.3 Ultra Settings: Top-45, cap 200)
     retriever = None
     if enable_tfidf:
-        print("  Fitting Multi-View TF-IDF Retriever matrices...", flush=True)
+        print("  Fitting Multi-View TF-IDF Retriever matrices (Top-45 per view, capacity 200)...", flush=True)
         t_ret = time.time()
         retriever = MultiViewCandidateRetriever(
             blocker=blocker,
             enable_tfidf_name=True,
             enable_tfidf_addr=True,
             enable_tfidf_char=True,
-            top_k_per_view=35,
-            max_total_candidates=160,
+            top_k_per_view=45,
+            max_total_candidates=200,
         )
         retriever.fit_target_corpora(target_lookup_raw)
         print(f"  TF-IDF matrices fitted in {time.time() - t_ret:.2f}s", flush=True)
         target_lookup_raw.clear()
         gc.collect()
 
-    print("  Extracting target address components & corpus frequency tracker...", flush=True)
+    print("  Extracting target structured address components & corpus frequency tracker...", flush=True)
     t_ac = time.time()
     tgt_addr_comps = {tid: extract_structured_address_components(e.norm_addr) for tid, e in target_lookup_fast.items()}
     freq_tracker = CorpusFrequencyTracker()
@@ -222,11 +179,13 @@ def run_test_inference(
     print(f"  Target primitives prepared in {time.time() - t_ac:.2f}s", flush=True)
     gc.collect()
 
-    # 3. Process Source 1 in Chunks & Stream Results
+    # -------------------------------------------------------------------------
+    # 3. STREAM S1 IN CHUNKS & GENERATE PREDICTIONS
+    # -------------------------------------------------------------------------
     matching_out_path = Path(output_dir) / "matching_results.tsv"
     candidate_out_path = Path(output_dir) / "candidate_pairs.tsv"
     
-    print(f"\n3. Streaming S1 Chunks & Generating Predictions...", flush=True)
+    print(f"\n3. Streaming S1 Chunks & Generating V1.3 Predictions...", flush=True)
     print(f"  Matching Output:  {matching_out_path}", flush=True)
     print(f"  Candidate Output: {candidate_out_path}", flush=True)
     
@@ -246,10 +205,12 @@ def run_test_inference(
     t_inference_start = time.time()
     chunk_idx = 0
     
-    postprocessor = PostProcessor(
+    # Exact V1.3 Surgical PostProcessor
+    postprocessor = SurgicalPostProcessorV1_3(
         base_threshold=threshold,
-        min_margin=0.05,
-        enable_singleton_guard=True,
+        s_guard=s_guard,
+        min_margin=min_margin,
+        joint_sim_floor=joint_sim_floor,
         enable_global_consistency=enable_global_consistency,
     )
     
@@ -260,6 +221,7 @@ def run_test_inference(
         s1_ids = []
         s1_objects: Dict[str, PrecomputedEntity] = {}
         s1_raw_tuples: Dict[str, Tuple[str, str, str, str]] = {}
+        s1_addr_comps_chunk: Dict[str, Any] = {}
         
         for eid, name, addr, country in rows:
             s1_ids.append(eid)
@@ -268,6 +230,7 @@ def run_test_inference(
             n_a = normalize_business_address(addr) if addr else ""
             s1_objects[eid] = PrecomputedEntity(n_n, c_n, n_a, country, eid)
             s1_raw_tuples[eid] = (n_n, c_n, n_a, country)
+            s1_addr_comps_chunk[eid] = extract_structured_address_components(n_a)
             
         df_chunk = pl.DataFrame({
             "entity_id": s1_ids,
@@ -298,7 +261,7 @@ def run_test_inference(
         
         for s1_id in s1_ids:
             s1_obj = s1_objects[s1_id]
-            s1_ac = extract_structured_address_components(s1_obj.norm_addr)
+            s1_ac = s1_addr_comps_chunk[s1_id]
             cand_set = final_cands_dict.get(s1_id, set())
             c_len = len(cand_set)
             cand_counts_sample.append(c_len)
@@ -311,7 +274,7 @@ def run_test_inference(
                     continue
                 tgt_ac = tgt_addr_comps.get(tid, extract_structured_address_components(""))
                 evid = evid_map.get(tid, {})
-                full_row = extract_v1_1_features(s1_obj, tgt_obj, s1_ac, tgt_ac, freq_tracker, evid)
+                full_row = extract_ultra_features(s1_obj, tgt_obj, s1_ac, tgt_ac, freq_tracker, evid)
                 feat_matrix_rows.append(full_row)
                 pair_meta.append((s1_id, tid))
                 
@@ -322,11 +285,25 @@ def run_test_inference(
             for (s1_id, tid), prob in zip(pair_meta, probs):
                 pair_prob_dict[s1_id].append((tid, float(prob)))
                 
-        final_matched_dict = postprocessor.apply(s1_ids, pair_prob_dict, final_cands_dict)
+        # Apply exact V1.3 decision logic with competition margins & singleton guard
+        final_matched_dict = postprocessor.apply(
+            s1_ids=s1_ids,
+            pair_probs=pair_prob_dict,
+            candidate_sets=final_cands_dict,
+            s1_objects=s1_objects,
+            target_lookup=target_lookup_fast,
+            s1_addr_comps=s1_addr_comps_chunk,
+            tgt_addr_comps=tgt_addr_comps,
+        )
         
         for s1_id in s1_ids:
             cand_set = final_cands_dict.get(s1_id, set())
             matched_set = final_matched_dict.get(s1_id, set())
+            
+            # Invariant Check: matched_set must strictly be subset of cand_set
+            invalid_matches = matched_set - cand_set
+            if invalid_matches:
+                raise AssertionError(f"Fatal: Matched IDs {invalid_matches} not in candidate set for S1 {s1_id}")
             
             cand_str = ",".join(sorted(cand_set))
             match_str = ",".join(sorted(matched_set))
@@ -342,7 +319,7 @@ def run_test_inference(
         total_s1_processed += len(s1_ids)
         elapsed = time.time() - t_inference_start
         rate = total_s1_processed / elapsed if elapsed > 0 else 0.0
-        if chunk_idx % 10 == 0 or total_s1_processed == len(rows):
+        if chunk_idx % 10 == 0 or (max_s1 is not None and total_s1_processed >= max_s1):
             print(f"    Chunk {chunk_idx:4d} | Processed: {total_s1_processed:8,d} S1s | Throughput: {rate:6.1f} S1/s | Elapsed: {elapsed:6.1f}s | Matches: {total_predicted_matches:8,d}", flush=True)
             f_match.flush()
             f_cand.flush()
@@ -386,8 +363,8 @@ def run_test_inference(
     p99_cand = float(np.percentile(cand_arr, 99))
     max_cand = int(np.max(cand_arr))
     
-    print("\n" + "=" * 75, flush=True)
-    print("V1.1 INFERENCE SUMMARY:", flush=True)
+    print("\n" + "=" * 80, flush=True)
+    print("V1.3 SURGICAL INFERENCE SUMMARY:", flush=True)
     print(f"  S1 Records Processed:      {total_s1_processed:,}", flush=True)
     print(f"  Total Candidate Pairs:     {total_candidate_pairs:,}", flush=True)
     print(f"  Average Candidates / S1:   {avg_cand:.2f}", flush=True)
@@ -400,14 +377,17 @@ def run_test_inference(
     print(f"  Average Matches / S1:      {total_predicted_matches/total_s1_processed:.3f}", flush=True)
     print(f"  Inference Time:            {t_inference:.2f}s ({throughput:.1f} S1/sec)", flush=True)
     print(f"  Total Execution Time:      {t_total:.2f}s", flush=True)
-    print("=" * 75, flush=True)
+    print("=" * 80, flush=True)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Production Test Inference for Entity Resolution (V1.1 Final)")
+    parser = argparse.ArgumentParser(description="Production Test Inference for Entity Resolution (V1.3 Surgical)")
     parser.add_argument("--test-dir", default="dataset/test", help="Path to test dataset directory")
     parser.add_argument("--output-dir", default="outputs", help="Output directory for results")
-    parser.add_argument("--model-path", default="models/lightgbm_v1_1_optimized.txt", help="Path to trained LightGBM model")
-    parser.add_argument("--threshold", type=float, default=0.950, help="Decision threshold for match prediction")
+    parser.add_argument("--model-path", default="models/lightgbm_v1_1_ultra.txt", help="Path to trained LightGBM model")
+    parser.add_argument("--threshold", type=float, default=0.965, help="Base decision threshold for match prediction")
+    parser.add_argument("--s-guard", type=float, default=0.900, help="Singleton protection threshold guard")
+    parser.add_argument("--min-margin", type=float, default=0.020, help="Minimum competition margin to runner-up")
+    parser.add_argument("--joint-sim-floor", type=float, default=0.450, help="Minimum joint name+address similarity floor")
     parser.add_argument("--chunk-size", type=int, default=5000, help="Chunk size for S1 streaming")
     parser.add_argument("--max-s1", type=int, default=None, help="Maximum number of S1 entities to process (for dry-run)")
     parser.add_argument("--no-tfidf", action="store_true", help="Disable multi-view TF-IDF candidate retrieval")
@@ -419,6 +399,9 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         model_path=args.model_path,
         threshold=args.threshold,
+        s_guard=args.s_guard,
+        min_margin=args.min_margin,
+        joint_sim_floor=args.joint_sim_floor,
         chunk_size=args.chunk_size,
         max_s1=args.max_s1,
         enable_tfidf=not args.no_tfidf,
