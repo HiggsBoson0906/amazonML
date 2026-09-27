@@ -16,8 +16,8 @@ class MultiViewCandidateRetriever:
         enable_tfidf_name: bool = True,
         enable_tfidf_addr: bool = True,
         enable_tfidf_char: bool = True,
-        top_k_per_view: int = 40,
-        max_total_candidates: int = 160,
+        top_k_per_view: int = 45,
+        max_total_candidates: int = 200,
     ):
         self.blocker = blocker
         self.enable_tfidf_name = enable_tfidf_name
@@ -83,13 +83,7 @@ class MultiViewCandidateRetriever:
         country: str,
         blocking_cands: Optional[Set[str]] = None,
     ) -> Tuple[Set[str], Dict[str, Dict[str, float]]]:
-        """Retrieve candidate set by taking union of Stage-5 blocking and TF-IDF top-K views.
-
-        
-        Returns:
-            (final_candidate_ids, retrieval_evidence_dict)
-            where retrieval_evidence_dict maps tid -> {view_name: score}
-        """
+        """Retrieve candidate set by taking union of Stage-5 blocking and TF-IDF top-K views."""
         c = country.strip() if country else "UNKNOWN"
         cand_set: Set[str] = set(blocking_cands) if blocking_cands is not None else set()
         evidence: Dict[str, Dict[str, float]] = defaultdict(dict)
@@ -111,14 +105,10 @@ class MultiViewCandidateRetriever:
             q_vec = v_name.transform([n_name])
             if q_vec.nnz > 0:
                 sims = self.name_matrices[c].dot(q_vec.T).toarray().ravel()
-                if k < n_tids:
-                    top_idx = np.argpartition(sims, -k)[-k:]
-                    top_idx = top_idx[np.argsort(-sims[top_idx])]
-                else:
-                    top_idx = np.argsort(-sims)
+                top_idx = np.argsort(-sims, kind='stable')[:k]
                 for idx in top_idx:
                     score = float(sims[idx])
-                    if score > 0.15:  # meaningful similarity threshold
+                    if score > 0.15:
                         tid = tids[idx]
                         evidence[tid]["tfidf_name"] = score
                         if len(cand_set) < self.max_total_candidates:
@@ -130,11 +120,7 @@ class MultiViewCandidateRetriever:
             q_vec = v_addr.transform([n_addr])
             if q_vec.nnz > 0:
                 sims = self.addr_matrices[c].dot(q_vec.T).toarray().ravel()
-                if k < n_tids:
-                    top_idx = np.argpartition(sims, -k)[-k:]
-                    top_idx = top_idx[np.argsort(-sims[top_idx])]
-                else:
-                    top_idx = np.argsort(-sims)
+                top_idx = np.argsort(-sims, kind='stable')[:k]
                 for idx in top_idx:
                     score = float(sims[idx])
                     if score > 0.25:
@@ -149,11 +135,7 @@ class MultiViewCandidateRetriever:
             q_vec = v_char.transform([n_name])
             if q_vec.nnz > 0:
                 sims = self.char_matrices[c].dot(q_vec.T).toarray().ravel()
-                if k < n_tids:
-                    top_idx = np.argpartition(sims, -k)[-k:]
-                    top_idx = top_idx[np.argsort(-sims[top_idx])]
-                else:
-                    top_idx = np.argsort(-sims)
+                top_idx = np.argsort(-sims, kind='stable')[:k]
                 for idx in top_idx:
                     score = float(sims[idx])
                     if score > 0.30:
@@ -163,3 +145,111 @@ class MultiViewCandidateRetriever:
                             cand_set.add(tid)
                             
         return cand_set, evidence
+
+    def retrieve_candidates_batch(
+        self,
+        s1_by_country: Dict[str, List[Tuple[str, str, str, str, str]]],
+        blocking_cands_map: Dict[str, Set[str]],
+    ) -> Tuple[Dict[str, Set[str]], Dict[str, Dict[str, Dict[str, float]]]]:
+        """Vectorized country-sharded batch candidate retriever using sparse matrix-matrix multiplication (GEMM)."""
+        final_cands: Dict[str, Set[str]] = {}
+        evidence_map: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
+
+        for c, s1_list in s1_by_country.items():
+            if not s1_list:
+                continue
+                
+            tids = self.country_target_ids.get(c, [])
+            n_tids = len(tids)
+            
+            # Initialize with blocking candidates
+            for sid, rn, rc, ra, rco in s1_list:
+                b_cands = blocking_cands_map.get(sid, set())
+                final_cands[sid] = set(b_cands)
+                for tid in b_cands:
+                    evidence_map[sid][tid]["blocking"] = 1.0
+
+            if n_tids == 0:
+                continue
+
+            k = min(self.top_k_per_view, n_tids)
+            
+            # 1. BATCH NAME TF-IDF
+            if self.enable_tfidf_name and c in self.name_vectorizers:
+                v_name = self.name_vectorizers[c]
+                M_name = self.name_matrices[c]
+                names = [item[1] if item[1] else " " for item in s1_list]
+                Q_name = v_name.transform(names)
+                sim_matrix = M_name.dot(Q_name.T).tocsc()
+                
+                for col_idx, (sid, rn, rc, ra, rco) in enumerate(s1_list):
+                    if not rn:
+                        continue
+                    col = sim_matrix.getcol(col_idx)
+                    if col.nnz == 0:
+                        continue
+                    row_indices = col.indices
+                    row_data = col.data
+                    
+                    top_local = np.argsort(-row_data, kind='stable')[:k]
+                    for loc in top_local:
+                        score = float(row_data[loc])
+                        if score > 0.15:
+                            tid = tids[row_indices[loc]]
+                            if len(final_cands[sid]) < self.max_total_candidates:
+                                final_cands[sid].add(tid)
+                            evidence_map[sid][tid]["tfidf_name"] = score
+
+            # 2. BATCH ADDR TF-IDF
+            if self.enable_tfidf_addr and c in self.addr_vectorizers:
+                v_addr = self.addr_vectorizers[c]
+                M_addr = self.addr_matrices[c]
+                addrs = [item[3] if item[3] else " " for item in s1_list]
+                Q_addr = v_addr.transform(addrs)
+                sim_matrix = M_addr.dot(Q_addr.T).tocsc()
+                
+                for col_idx, (sid, rn, rc, ra, rco) in enumerate(s1_list):
+                    if not ra:
+                        continue
+                    col = sim_matrix.getcol(col_idx)
+                    if col.nnz == 0:
+                        continue
+                    row_indices = col.indices
+                    row_data = col.data
+                    
+                    top_local = np.argsort(-row_data, kind='stable')[:k]
+                    for loc in top_local:
+                        score = float(row_data[loc])
+                        if score > 0.25:
+                            tid = tids[row_indices[loc]]
+                            if len(final_cands[sid]) < self.max_total_candidates:
+                                final_cands[sid].add(tid)
+                            evidence_map[sid][tid]["tfidf_addr"] = score
+
+            # 3. BATCH CHAR 3-GRAM TF-IDF
+            if self.enable_tfidf_char and c in self.char_vectorizers:
+                v_char = self.char_vectorizers[c]
+                M_char = self.char_matrices[c]
+                names = [item[1] if item[1] else " " for item in s1_list]
+                Q_char = v_char.transform(names)
+                sim_matrix = M_char.dot(Q_char.T).tocsc()
+                
+                for col_idx, (sid, rn, rc, ra, rco) in enumerate(s1_list):
+                    if not rn:
+                        continue
+                    col = sim_matrix.getcol(col_idx)
+                    if col.nnz == 0:
+                        continue
+                    row_indices = col.indices
+                    row_data = col.data
+                    
+                    top_local = np.argsort(-row_data, kind='stable')[:k]
+                    for loc in top_local:
+                        score = float(row_data[loc])
+                        if score > 0.30:
+                            tid = tids[row_indices[loc]]
+                            if len(final_cands[sid]) < self.max_total_candidates:
+                                final_cands[sid].add(tid)
+                            evidence_map[sid][tid]["tfidf_char"] = score
+
+        return final_cands, evidence_map

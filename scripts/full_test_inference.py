@@ -17,7 +17,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 if sys.platform == "win32":
-    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
 
 from src.normalize import (
     normalize_business_name,
@@ -27,17 +27,17 @@ from src.normalize import (
 from src.blocking import InvertedIndexBlocker
 from src.features import (
     STAGE5_FEATURE_COLS,
+    ULTRA_FEATURE_COLS,
     PrecomputedEntity,
-    extract_pairwise_features_fast,
+    OptimizedEntity,
+    extract_ultra_features_fast,
 )
 from src.retrieval import MultiViewCandidateRetriever
 from src.ranking import (
     CorpusFrequencyTracker,
     extract_structured_address_components,
-    compute_address_component_features,
 )
 from src.postprocess import SurgicalPostProcessorV1_3
-from scripts.push_to_98 import ULTRA_FEATURE_COLS, extract_ultra_features
 
 DELIM = "\t"
 
@@ -55,7 +55,7 @@ def run_test_inference(
     enable_global_consistency: bool = True,
 ):
     print("=" * 80, flush=True)
-    print("PRODUCTION TEST INFERENCE PIPELINE (V1.3 SURGICAL) — AMAZON ML CHALLENGE 2026", flush=True)
+    print("PRODUCTION TEST INFERENCE PIPELINE (V1.3 SURGICAL OPTIMIZED) — AMAZON ML 2026", flush=True)
     print("=" * 80, flush=True)
     print(f"  Test Directory:         {test_dir}", flush=True)
     print(f"  Output Directory:       {output_dir}", flush=True)
@@ -106,8 +106,7 @@ def run_test_inference(
     t0 = time.time()
     
     blocker = InvertedIndexBlocker(max_key_frequency=500, max_candidates_per_s1=200)
-    target_lookup_fast: Dict[str, PrecomputedEntity] = {}
-    target_lookup_raw: Dict[str, Tuple[str, str, str, str]] = {}
+    raw_targets: Dict[str, Tuple[str, str, str, str]] = {}
     total_targets = 0
     
     def process_target_file(filepath: Path, src_name: str):
@@ -128,9 +127,7 @@ def run_test_inference(
                 c_name = extract_core_business_name(n_name)
                 n_addr = normalize_business_address(addr) if addr else ""
                 
-                target_lookup_fast[tid] = PrecomputedEntity(n_name, c_name, n_addr, country, tid)
-                if enable_tfidf:
-                    target_lookup_raw[tid] = (n_name, c_name, n_addr, country)
+                raw_targets[tid] = (n_name, c_name, n_addr, country)
                     
                 if country:
                     keys = blocker._extract_all_keys(n_name, c_name, n_addr, name)
@@ -164,20 +161,31 @@ def run_test_inference(
             top_k_per_view=45,
             max_total_candidates=200,
         )
-        retriever.fit_target_corpora(target_lookup_raw)
+        retriever.fit_target_corpora(raw_targets)
         print(f"  TF-IDF matrices fitted in {time.time() - t_ret:.2f}s", flush=True)
-        target_lookup_raw.clear()
-        gc.collect()
 
-    print("  Extracting target structured address components & corpus frequency tracker...", flush=True)
+    print("  Precomputing target invariants, frequencies & structured primitives...", flush=True)
     t_ac = time.time()
-    tgt_addr_comps = {tid: extract_structured_address_components(e.norm_addr) for tid, e in target_lookup_fast.items()}
     freq_tracker = CorpusFrequencyTracker()
-    all_tgt_names = [e.norm_name for e in target_lookup_fast.values()]
-    all_tgt_addrs = [e.norm_addr for e in target_lookup_fast.values()]
+    all_tgt_names = [r[0] for r in raw_targets.values()]
+    all_tgt_addrs = [r[2] for r in raw_targets.values()]
     freq_tracker.fit(all_tgt_names, all_tgt_addrs)
-    print(f"  Target primitives prepared in {time.time() - t_ac:.2f}s", flush=True)
+    
+    target_lookup: Dict[str, OptimizedEntity] = {}
+    for tid, (n_name, c_name, n_addr, country) in raw_targets.items():
+        ac = extract_structured_address_components(n_addr) if n_addr else None
+        target_lookup[tid] = OptimizedEntity(
+            norm_name=n_name,
+            core_name=c_name,
+            norm_addr=n_addr,
+            country=country,
+            src_id=tid,
+            ac=ac,
+            freq_tracker=freq_tracker
+        )
+    raw_targets.clear()
     gc.collect()
+    print(f"  Target precomputation complete in {time.time() - t_ac:.2f}s", flush=True)
 
     # -------------------------------------------------------------------------
     # 3. STREAM S1 IN CHUNKS & GENERATE PREDICTIONS
@@ -219,8 +227,9 @@ def run_test_inference(
         chunk_idx += 1
         
         s1_ids = []
-        s1_objects: Dict[str, PrecomputedEntity] = {}
+        s1_objects: Dict[str, OptimizedEntity] = {}
         s1_raw_tuples: Dict[str, Tuple[str, str, str, str]] = {}
+        s1_by_country = defaultdict(list)
         s1_addr_comps_chunk: Dict[str, Any] = {}
         
         for eid, name, addr, country in rows:
@@ -228,9 +237,19 @@ def run_test_inference(
             n_n = normalize_business_name(name)
             c_n = extract_core_business_name(n_n)
             n_a = normalize_business_address(addr) if addr else ""
-            s1_objects[eid] = PrecomputedEntity(n_n, c_n, n_a, country, eid)
+            ac = extract_structured_address_components(n_a) if n_a else None
+            s1_objects[eid] = OptimizedEntity(
+                norm_name=n_n,
+                core_name=c_n,
+                norm_addr=n_a,
+                country=country,
+                src_id=eid,
+                ac=ac,
+                freq_tracker=freq_tracker
+            )
             s1_raw_tuples[eid] = (n_n, c_n, n_a, country)
-            s1_addr_comps_chunk[eid] = extract_structured_address_components(n_a)
+            s1_by_country[country.strip() if country else "UNKNOWN"].append((eid, n_n, c_n, n_a, country))
+            s1_addr_comps_chunk[eid] = ac or {"postal_code": "", "house_num": "", "digits": set()}
             
         df_chunk = pl.DataFrame({
             "entity_id": s1_ids,
@@ -242,26 +261,21 @@ def run_test_inference(
         })
         
         stage5_cands = blocker.generate_candidates_for_s1(df_chunk)
-        final_cands_dict: Dict[str, Set[str]] = {}
-        ret_evidence_dict: Dict[str, Dict[str, Dict[str, float]]] = {}
         
-        for eid in s1_ids:
-            s5_set = stage5_cands.get(eid, set())
-            if retriever is not None:
-                rn, rc, ra, rco = s1_raw_tuples[eid]
-                c_set, evid = retriever.retrieve_candidates(eid, rn, rc, ra, rco, blocking_cands=s5_set)
-                final_cands_dict[eid] = c_set
-                ret_evidence_dict[eid] = evid
-            else:
-                final_cands_dict[eid] = s5_set
-                ret_evidence_dict[eid] = {}
+        if retriever is not None:
+            final_cands_dict, ret_evidence_dict = retriever.retrieve_candidates_batch(
+                s1_by_country=s1_by_country,
+                blocking_cands_map=stage5_cands
+            )
+        else:
+            final_cands_dict = stage5_cands
+            ret_evidence_dict = {}
                 
         feat_matrix_rows = []
         pair_meta = []
         
         for s1_id in s1_ids:
             s1_obj = s1_objects[s1_id]
-            s1_ac = s1_addr_comps_chunk[s1_id]
             cand_set = final_cands_dict.get(s1_id, set())
             c_len = len(cand_set)
             cand_counts_sample.append(c_len)
@@ -269,12 +283,11 @@ def run_test_inference(
             
             evid_map = ret_evidence_dict.get(s1_id, {})
             for tid in cand_set:
-                tgt_obj = target_lookup_fast.get(tid)
+                tgt_obj = target_lookup.get(tid)
                 if not tgt_obj:
                     continue
-                tgt_ac = tgt_addr_comps.get(tid, extract_structured_address_components(""))
                 evid = evid_map.get(tid, {})
-                full_row = extract_ultra_features(s1_obj, tgt_obj, s1_ac, tgt_ac, freq_tracker, evid)
+                full_row = extract_ultra_features_fast(s1_obj, tgt_obj, freq_tracker, evid)
                 feat_matrix_rows.append(full_row)
                 pair_meta.append((s1_id, tid))
                 
@@ -291,9 +304,9 @@ def run_test_inference(
             pair_probs=pair_prob_dict,
             candidate_sets=final_cands_dict,
             s1_objects=s1_objects,
-            target_lookup=target_lookup_fast,
+            target_lookup=target_lookup,
             s1_addr_comps=s1_addr_comps_chunk,
-            tgt_addr_comps=tgt_addr_comps,
+            tgt_addr_comps=None,
         )
         
         for s1_id in s1_ids:
@@ -348,50 +361,46 @@ def run_test_inference(
         if chunk_rows and (max_s1 is None or total_s1_processed < max_s1):
             process_chunk(chunk_rows)
             chunk_rows = []
-            
+
     f_match.close()
     f_cand.close()
     
-    t_total = time.time() - t_global_start
-    t_inference = time.time() - t_inference_start
-    throughput = total_s1_processed / t_inference if t_inference > 0 else 0.0
-    
-    cand_arr = np.array(cand_counts_sample) if cand_counts_sample else np.array([0])
-    avg_cand = float(np.mean(cand_arr))
-    median_cand = float(np.median(cand_arr))
-    p95_cand = float(np.percentile(cand_arr, 95))
-    p99_cand = float(np.percentile(cand_arr, 99))
-    max_cand = int(np.max(cand_arr))
+    t_total_end = time.time()
+    total_runtime = t_total_end - t_global_start
+    inf_runtime = t_total_end - t_inference_start
+    overall_throughput = total_s1_processed / inf_runtime if inf_runtime > 0 else 0.0
     
     print("\n" + "=" * 80, flush=True)
-    print("V1.3 SURGICAL INFERENCE SUMMARY:", flush=True)
-    print(f"  S1 Records Processed:      {total_s1_processed:,}", flush=True)
-    print(f"  Total Candidate Pairs:     {total_candidate_pairs:,}", flush=True)
-    print(f"  Average Candidates / S1:   {avg_cand:.2f}", flush=True)
-    print(f"  Median Candidates / S1:    {median_cand:.1f}", flush=True)
-    print(f"  P95 Candidates / S1:       {p95_cand:.1f}", flush=True)
-    print(f"  P99 Candidates / S1:       {p99_cand:.1f}", flush=True)
-    print(f"  Maximum Candidates / S1:   {max_cand}", flush=True)
-    print(f"  Total Predicted Matches:   {total_predicted_matches:,}", flush=True)
-    print(f"  Total Empty Predictions:   {total_empty_predictions:,} ({total_empty_predictions/total_s1_processed*100:.2f}%)", flush=True)
-    print(f"  Average Matches / S1:      {total_predicted_matches/total_s1_processed:.3f}", flush=True)
-    print(f"  Inference Time:            {t_inference:.2f}s ({throughput:.1f} S1/sec)", flush=True)
-    print(f"  Total Execution Time:      {t_total:.2f}s", flush=True)
+    print("PRODUCTION INFERENCE RUN COMPLETED SUCCESSFULLY", flush=True)
+    print("=" * 80, flush=True)
+    print(f"  Total S1 Entities Processed:    {total_s1_processed:,}", flush=True)
+    print(f"  Total Candidate Pairs Scored:   {total_candidate_pairs:,}", flush=True)
+    print(f"  Total Matches Predicted:        {total_predicted_matches:,}", flush=True)
+    print(f"  Singletons (Empty Predictions): {total_empty_predictions:,} ({total_empty_predictions/total_s1_processed*100:.2f}%)", flush=True)
+    if cand_counts_sample:
+        print(f"  Average Candidates / S1:        {np.mean(cand_counts_sample):.2f}", flush=True)
+        print(f"  Median Candidates / S1:         {np.median(cand_counts_sample):.0f}", flush=True)
+        print(f"  Max Candidates / S1:            {np.max(cand_counts_sample)}", flush=True)
+    print(f"  Total Pipeline Time:            {total_runtime:.2f}s ({total_runtime/60:.2f} min)", flush=True)
+    print(f"  Inference-Only Time:            {inf_runtime:.2f}s ({inf_runtime/60:.2f} min)", flush=True)
+    print(f"  Sustained Inference Throughput: {overall_throughput:.2f} S1/sec", flush=True)
+    print(f"  Matching TSV:                   {matching_out_path} ({os.path.getsize(matching_out_path)/1024/1024:.2f} MB)", flush=True)
+    print(f"  Candidate TSV:                  {candidate_out_path} ({os.path.getsize(candidate_out_path)/1024/1024:.2f} MB)", flush=True)
     print("=" * 80, flush=True)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Production Test Inference for Entity Resolution (V1.3 Surgical)")
-    parser.add_argument("--test-dir", default="dataset/test", help="Path to test dataset directory")
-    parser.add_argument("--output-dir", default="outputs", help="Output directory for results")
-    parser.add_argument("--model-path", default="models/lightgbm_v1_1_ultra.txt", help="Path to trained LightGBM model")
-    parser.add_argument("--threshold", type=float, default=0.965, help="Base decision threshold for match prediction")
-    parser.add_argument("--s-guard", type=float, default=0.900, help="Singleton protection threshold guard")
-    parser.add_argument("--min-margin", type=float, default=0.020, help="Minimum competition margin to runner-up")
-    parser.add_argument("--joint-sim-floor", type=float, default=0.450, help="Minimum joint name+address similarity floor")
-    parser.add_argument("--chunk-size", type=int, default=5000, help="Chunk size for S1 streaming")
-    parser.add_argument("--max-s1", type=int, default=None, help="Maximum number of S1 entities to process (for dry-run)")
-    parser.add_argument("--no-tfidf", action="store_true", help="Disable multi-view TF-IDF candidate retrieval")
-    parser.add_argument("--no-global-consistency", action="store_true", help="Disable global target consistency post-processing")
+    parser = argparse.ArgumentParser(description="Run Production Test Inference (V1.3 Surgical Optimized)")
+    parser.add_argument("--test-dir", type=str, default="dataset/test", help="Path to test dataset folder")
+    parser.add_argument("--output-dir", type=str, default="outputs", help="Directory for output TSVs")
+    parser.add_argument("--model-path", type=str, default="models/lightgbm_v1_1_ultra.txt", help="Path to trained model")
+    parser.add_argument("--threshold", type=float, default=0.965, help="V1.3 base threshold")
+    parser.add_argument("--s-guard", type=float, default=0.900, help="V1.3 singleton guard threshold")
+    parser.add_argument("--min-margin", type=float, default=0.020, help="V1.3 minimum competition margin")
+    parser.add_argument("--joint-sim-floor", type=float, default=0.450, help="V1.3 joint similarity floor")
+    parser.add_argument("--chunk-size", type=int, default=5000, help="Number of S1 records per chunk")
+    parser.add_argument("--max-s1", type=int, default=None, help="Maximum S1 records to evaluate (for smoke test)")
+    parser.add_argument("--disable-tfidf", action="store_true", help="Disable multi-view TF-IDF retrieval")
+    parser.add_argument("--disable-global-consistency", action="store_true", help="Disable global target exclusivity")
     args = parser.parse_args()
     
     run_test_inference(
@@ -404,6 +413,6 @@ if __name__ == "__main__":
         joint_sim_floor=args.joint_sim_floor,
         chunk_size=args.chunk_size,
         max_s1=args.max_s1,
-        enable_tfidf=not args.no_tfidf,
-        enable_global_consistency=not args.no_global_consistency,
+        enable_tfidf=not args.disable_tfidf,
+        enable_global_consistency=not args.disable_global_consistency,
     )

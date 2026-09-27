@@ -102,7 +102,10 @@ class SurgicalPostProcessorV1_3:
 
                 tgt_ac = tgt_addr_comps.get(tid)
                 if tgt_ac is None:
-                    tgt_ac = extract_structured_address_components(tgt_obj.norm_addr)
+                    if hasattr(tgt_obj, "postal_code"):
+                        tgt_ac = {"postal_code": tgt_obj.postal_code, "house_num": tgt_obj.house_num, "digits": getattr(tgt_obj, "digits_set", set())}
+                    else:
+                        tgt_ac = extract_structured_address_components(tgt_obj.norm_addr)
 
                 name_jw = JaroWinkler.similarity(s1_obj.norm_name, tgt_obj.norm_name)
                 addr_jw = JaroWinkler.similarity(s1_obj.norm_addr, tgt_obj.norm_addr) if (s1_obj.norm_addr and tgt_obj.norm_addr) else 0.0
