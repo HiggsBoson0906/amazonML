@@ -150,7 +150,7 @@ class MultiViewCandidateRetriever:
         s1_by_country: Dict[str, List[Tuple[str, str, str, str, str]]],
         blocking_cands_map: Dict[str, Set[str]],
     ) -> Tuple[Dict[str, Set[str]], Dict[str, Dict[str, Dict[str, float]]]]:
-        """Vectorized country-sharded batch candidate retriever using sparse matrix-matrix multiplication (GEMM)."""
+        """Bounded-memory country-sharded candidate retriever using sparse matrix-vector operations."""
         final_cands: Dict[str, Set[str]] = {}
         evidence_map: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
 
@@ -172,83 +172,62 @@ class MultiViewCandidateRetriever:
                 continue
 
             k = min(self.top_k_per_view, n_tids)
+            has_name = self.enable_tfidf_name and (c in self.name_vectorizers)
+            has_addr = self.enable_tfidf_addr and (c in self.addr_vectorizers)
+            has_char = self.enable_tfidf_char and (c in self.char_vectorizers)
+
+            v_name = self.name_vectorizers.get(c) if has_name else None
+            M_name = self.name_matrices.get(c) if has_name else None
             
-            # 1. BATCH NAME TF-IDF
-            if self.enable_tfidf_name and c in self.name_vectorizers:
-                v_name = self.name_vectorizers[c]
-                M_name = self.name_matrices[c]
-                names = [item[1] if item[1] else " " for item in s1_list]
-                Q_name = v_name.transform(names)
-                sim_matrix = M_name.dot(Q_name.T).tocsc()
-                
-                for col_idx, (sid, rn, rc, ra, rco) in enumerate(s1_list):
-                    if not rn:
-                        continue
-                    col = sim_matrix.getcol(col_idx)
-                    if col.nnz == 0:
-                        continue
-                    row_indices = col.indices
-                    row_data = col.data
-                    
-                    top_local = np.argsort(-row_data, kind='stable')[:k]
-                    for loc in top_local:
-                        score = float(row_data[loc])
-                        if score > 0.15:
-                            tid = tids[row_indices[loc]]
-                            if len(final_cands[sid]) < self.max_total_candidates:
-                                final_cands[sid].add(tid)
-                            evidence_map[sid][tid]["tfidf_name"] = score
+            v_addr = self.addr_vectorizers.get(c) if has_addr else None
+            M_addr = self.addr_matrices.get(c) if has_addr else None
+            
+            v_char = self.char_vectorizers.get(c) if has_char else None
+            M_char = self.char_matrices.get(c) if has_char else None
 
-            # 2. BATCH ADDR TF-IDF
-            if self.enable_tfidf_addr and c in self.addr_vectorizers:
-                v_addr = self.addr_vectorizers[c]
-                M_addr = self.addr_matrices[c]
-                addrs = [item[3] if item[3] else " " for item in s1_list]
-                Q_addr = v_addr.transform(addrs)
-                sim_matrix = M_addr.dot(Q_addr.T).tocsc()
+            for sid, rn, rc, ra, rco in s1_list:
+                cand_set = final_cands[sid]
                 
-                for col_idx, (sid, rn, rc, ra, rco) in enumerate(s1_list):
-                    if not ra:
-                        continue
-                    col = sim_matrix.getcol(col_idx)
-                    if col.nnz == 0:
-                        continue
-                    row_indices = col.indices
-                    row_data = col.data
-                    
-                    top_local = np.argsort(-row_data, kind='stable')[:k]
-                    for loc in top_local:
-                        score = float(row_data[loc])
-                        if score > 0.25:
-                            tid = tids[row_indices[loc]]
-                            if len(final_cands[sid]) < self.max_total_candidates:
-                                final_cands[sid].add(tid)
-                            evidence_map[sid][tid]["tfidf_addr"] = score
+                # 1. Name TF-IDF Top-K
+                if has_name and rn:
+                    q_vec = v_name.transform([rn])
+                    if q_vec.nnz > 0:
+                        sims = M_name.dot(q_vec.T).toarray().ravel()
+                        top_idx = np.argsort(-sims, kind='stable')[:k]
+                        for idx in top_idx:
+                            score = float(sims[idx])
+                            if score > 0.15:
+                                tid = tids[idx]
+                                evidence_map[sid][tid]["tfidf_name"] = score
+                                if len(cand_set) < self.max_total_candidates:
+                                    cand_set.add(tid)
 
-            # 3. BATCH CHAR 3-GRAM TF-IDF
-            if self.enable_tfidf_char and c in self.char_vectorizers:
-                v_char = self.char_vectorizers[c]
-                M_char = self.char_matrices[c]
-                names = [item[1] if item[1] else " " for item in s1_list]
-                Q_char = v_char.transform(names)
-                sim_matrix = M_char.dot(Q_char.T).tocsc()
-                
-                for col_idx, (sid, rn, rc, ra, rco) in enumerate(s1_list):
-                    if not rn:
-                        continue
-                    col = sim_matrix.getcol(col_idx)
-                    if col.nnz == 0:
-                        continue
-                    row_indices = col.indices
-                    row_data = col.data
-                    
-                    top_local = np.argsort(-row_data, kind='stable')[:k]
-                    for loc in top_local:
-                        score = float(row_data[loc])
-                        if score > 0.30:
-                            tid = tids[row_indices[loc]]
-                            if len(final_cands[sid]) < self.max_total_candidates:
-                                final_cands[sid].add(tid)
-                            evidence_map[sid][tid]["tfidf_char"] = score
+                # 2. Address TF-IDF Top-K
+                if has_addr and ra:
+                    q_vec = v_addr.transform([ra])
+                    if q_vec.nnz > 0:
+                        sims = M_addr.dot(q_vec.T).toarray().ravel()
+                        top_idx = np.argsort(-sims, kind='stable')[:k]
+                        for idx in top_idx:
+                            score = float(sims[idx])
+                            if score > 0.25:
+                                tid = tids[idx]
+                                evidence_map[sid][tid]["tfidf_addr"] = score
+                                if len(cand_set) < self.max_total_candidates:
+                                    cand_set.add(tid)
+
+                # 3. Char 3-gram TF-IDF Top-K
+                if has_char and rn:
+                    q_vec = v_char.transform([rn])
+                    if q_vec.nnz > 0:
+                        sims = M_char.dot(q_vec.T).toarray().ravel()
+                        top_idx = np.argsort(-sims, kind='stable')[:k]
+                        for idx in top_idx:
+                            score = float(sims[idx])
+                            if score > 0.30:
+                                tid = tids[idx]
+                                evidence_map[sid][tid]["tfidf_char"] = score
+                                if len(cand_set) < self.max_total_candidates:
+                                    cand_set.add(tid)
 
         return final_cands, evidence_map

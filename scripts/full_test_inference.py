@@ -404,7 +404,7 @@ if __name__ == "__main__":
     parser.add_argument("--s-guard", type=float, default=0.900, help="V1.3 singleton guard threshold")
     parser.add_argument("--min-margin", type=float, default=0.020, help="V1.3 minimum competition margin")
     parser.add_argument("--joint-sim-floor", type=float, default=0.450, help="V1.3 joint similarity floor")
-    parser.add_argument("--chunk-size", type=int, default=5000, help="Number of S1 records per chunk")
+    parser.add_argument("--chunk-size", type=int, default=1000, help="Number of S1 records per chunk")
     parser.add_argument("--max-s1", type=int, default=None, help="Maximum S1 records to evaluate (for smoke test)")
     parser.add_argument("--disable-tfidf", action="store_true", help="Disable multi-view TF-IDF retrieval")
     parser.add_argument("--disable-global-consistency", action="store_true", help="Disable global target exclusivity")
