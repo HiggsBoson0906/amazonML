@@ -1,0 +1,98 @@
+@"
+# ================================
+# Amazon ML Challenge - Git Ignore
+# ================================
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# ================================
+# Challenge datasets
+# ================================
+dataset/
+data/
+
+# ================================
+# Generated outputs
+# ================================
+outputs/
+results/
+submissions/
+*.tsv
+*.csv
+*.parquet
+*.jsonl
+
+# ================================
+# Trained models / large artifacts
+# ================================
+models/
+*.txt
+*.bin
+*.pkl
+*.pickle
+*.joblib
+*.model
+*.lgb
+*.onnx
+
+# ================================
+# Logs / temporary files
+# ================================
+*.log
+*.tmp
+*.temp
+logs/
+tmp/
+temp/
+
+# ================================
+# IDE
+# ================================
+.vscode/
+.idea/
+*.code-workspace
+
+# Antigravity
+.agents/
+.antigravity/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ================================
+# Large archives
+# ================================
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# ================================
+# Local experiment artifacts
+# ================================
+experiments/*/artifacts/
+experiments/*/outputs/
+"@ | Set-Content .gitignore
