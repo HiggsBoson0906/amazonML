@@ -1,4 +1,3 @@
-@"
 # ================================
 # Amazon ML Challenge - Git Ignore
 # ================================
@@ -95,4 +94,3 @@ desktop.ini
 # ================================
 experiments/*/artifacts/
 experiments/*/outputs/
-"@ | Set-Content .gitignore

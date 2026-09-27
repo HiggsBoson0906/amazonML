@@ -1,0 +1,39 @@
+{
+  "pipeline_version": "v1.0-final-candidate",
+  "blocker": {
+    "version": "stage5_optimized",
+    "max_key_frequency": 500,
+    "max_candidates_per_s1": 160
+  },
+  "retrieval": {
+    "enable_tfidf_name": true,
+    "enable_tfidf_addr": true,
+    "enable_tfidf_char": true,
+    "top_k_per_view": 30,
+    "max_total_candidates": 160
+  },
+  "features": {
+    "version": "v1_rich_37",
+    "feature_count": 37,
+    "use_address_components": true,
+    "use_rarity": true,
+    "use_retrieval_evidence": true
+  },
+  "model": {
+    "type": "lightgbm",
+    "model_path": "models/lightgbm_v1_optimized.txt",
+    "threshold": 0.960
+  },
+  "postprocess": {
+    "enable_singleton_guard": true,
+    "enable_global_consistency": true,
+    "min_margin": 0.05
+  },
+  "benchmarks": {
+    "candidate_recall": 0.9911,
+    "macro_f05": 0.9620,
+    "macro_precision": 0.9762,
+    "macro_recall": 0.9310,
+    "singleton_accuracy": 0.9402
+  }
+}

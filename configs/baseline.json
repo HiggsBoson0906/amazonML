@@ -1,0 +1,29 @@
+{
+  "experiment_name": "E0_stage5_baseline",
+  "blocker": {
+    "version": "stage5",
+    "max_key_frequency": 500,
+    "max_candidates_per_s1": 160
+  },
+  "retrieval": {
+    "enable_tfidf": false,
+    "enable_bm25": false,
+    "tfidf_top_k": 40
+  },
+  "features": {
+    "version": "stage5_25",
+    "use_address_components": false,
+    "use_rarity": false,
+    "use_retrieval_evidence": false,
+    "use_relative_margins": false
+  },
+  "model": {
+    "type": "lightgbm",
+    "model_path": "models/lightgbm_stage5.txt",
+    "threshold": 0.980
+  },
+  "postprocess": {
+    "enable_singleton_guard": false,
+    "enable_global_consistency": false
+  }
+}
