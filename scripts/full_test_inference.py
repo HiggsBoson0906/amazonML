@@ -4,12 +4,13 @@ import time
 import argparse
 import gc
 from pathlib import Path
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Dict, List, Set, Tuple, Optional, Any
 from collections import defaultdict
 
 import polars as pl
 import numpy as np
 import lightgbm as lgb
+from rapidfuzz.distance import JaroWinkler
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -37,27 +38,86 @@ from src.ranking import (
 )
 from src.postprocess import PostProcessor
 
-EXPANDED_FEATURE_COLS = STAGE5_FEATURE_COLS + [
+V1_1_FEATURE_COLS = STAGE5_FEATURE_COLS + [
     "addr_hnum_match", "addr_hnum_conflict", "addr_postal_match",
     "addr_postal_conflict", "addr_digits_overlap", "addr_digits_conflict",
     "s1_name_log_freq", "tgt_name_log_freq", "s1_addr_log_freq", "tgt_addr_log_freq",
     "retrieval_views_count", "max_tfidf_score",
+    "name_jaro_winkler", "name_token_containment",
+    "addr_jaro_winkler", "addr_token_containment",
+    "name_weighted_jaccard", "addr_weighted_jaccard",
+    "cand_score_margin", "cand_pool_ambiguity",
 ]
 
 DELIM = "\t"
 
+def extract_v1_1_features(
+    s1: PrecomputedEntity,
+    tgt: PrecomputedEntity,
+    s1_ac: Dict[str, Any],
+    tgt_ac: Dict[str, Any],
+    freq_tracker: CorpusFrequencyTracker,
+    evid_map: Dict[str, float],
+) -> List[float]:
+    base = extract_pairwise_features_fast(s1, tgt)
+    ac_feats = compute_address_component_features(s1_ac, tgt_ac)
+    s1_nf = freq_tracker.get_name_freq_feature(s1.norm_name)
+    tgt_nf = freq_tracker.get_name_freq_feature(tgt.norm_name)
+    s1_af = freq_tracker.get_addr_freq_feature(s1.norm_addr)
+    tgt_af = freq_tracker.get_addr_freq_feature(tgt.norm_addr)
+    
+    ret_views = float(len(evid_map)) if evid_map else 1.0
+    max_tfidf = max([v for k, v in evid_map.items() if k != "blocking"], default=0.0)
+    
+    name_jw = JaroWinkler.similarity(s1.norm_name, tgt.norm_name)
+    addr_jw = JaroWinkler.similarity(s1.norm_addr, tgt.norm_addr) if (s1.norm_addr and tgt.norm_addr) else 0.0
+    
+    if s1.core_toks and tgt.core_toks:
+        name_containment = max(float(s1.core_toks.issubset(tgt.core_toks)), float(tgt.core_toks.issubset(s1.core_toks)))
+        inter = s1.core_toks.intersection(tgt.core_toks)
+        un = s1.core_toks.union(tgt.core_toks)
+        w_inter = sum(freq_tracker.get_token_idf(t) for t in inter)
+        w_un = sum(freq_tracker.get_token_idf(t) for t in un)
+        name_w_jaccard = float(w_inter / w_un) if w_un > 0 else 0.0
+    else:
+        name_containment = 0.0
+        name_w_jaccard = 0.0
+        
+    if s1.addr_toks and tgt.addr_toks:
+        addr_containment = max(float(s1.addr_toks.issubset(tgt.addr_toks)), float(tgt.addr_toks.issubset(s1.addr_toks)))
+        inter_a = s1.addr_toks.intersection(tgt.addr_toks)
+        un_a = s1.addr_toks.union(tgt.addr_toks)
+        w_inter_a = sum(freq_tracker.get_token_idf(t) for t in inter_a)
+        w_un_a = sum(freq_tracker.get_token_idf(t) for t in un_a)
+        addr_w_jaccard = float(w_inter_a / w_un_a) if w_un_a > 0 else 0.0
+    else:
+        addr_containment = 0.0
+        addr_w_jaccard = 0.0
+        
+    return base + [
+        ac_feats["addr_hnum_match"], ac_feats["addr_hnum_conflict"],
+        ac_feats["addr_postal_match"], ac_feats["addr_postal_conflict"],
+        ac_feats["addr_digits_overlap"], ac_feats["addr_digits_conflict"],
+        s1_nf, tgt_nf, s1_af, tgt_af,
+        ret_views, max_tfidf,
+        name_jw, name_containment,
+        addr_jw, addr_containment,
+        name_w_jaccard, addr_w_jaccard,
+        0.0, 1.0,  # default margin and ambiguity placeholders
+    ]
+
 def run_test_inference(
     test_dir: str = "dataset/test",
     output_dir: str = "outputs",
-    model_path: str = "models/lightgbm_v1_optimized.txt",
-    threshold: float = 0.960,
+    model_path: str = "models/lightgbm_v1_1_optimized.txt",
+    threshold: float = 0.950,
     chunk_size: int = 5000,
     max_s1: Optional[int] = None,
     enable_tfidf: bool = True,
     enable_global_consistency: bool = True,
 ):
     print("=" * 75, flush=True)
-    print("PRODUCTION TEST INFERENCE PIPELINE (V1.0 FINAL) — AMAZON ML CHALLENGE 2026", flush=True)
+    print("PRODUCTION TEST INFERENCE PIPELINE (V1.1 FINAL) — AMAZON ML CHALLENGE 2026", flush=True)
     print(f"  Test Directory:         {test_dir}", flush=True)
     print(f"  Output Directory:       {output_dir}", flush=True)
     print(f"  Model Artifact:         {model_path}", flush=True)
@@ -76,27 +136,21 @@ def run_test_inference(
     source2_file = test_path / "test_source2.tsv"
     source3_file = test_path / "test_source3.tsv"
     
-    # ---------------------------------------------------------
     # 1. Load Trained LightGBM Model
-    # ---------------------------------------------------------
     print("\n1. Loading Trained LightGBM Model...", flush=True)
     if not os.path.isfile(model_path):
         raise FileNotFoundError(f"Model file not found at: {model_path}")
     model = lgb.Booster(model_file=str(model_path))
     model_features = model.feature_name()
-    is_rich_model = (len(model_features) == len(EXPANDED_FEATURE_COLS))
-    print(f"  Loaded model successfully with {len(model_features)} features verified ({'V1.0 Rich 37-Feat' if is_rich_model else 'Stage-5 25-Feat'}).", flush=True)
+    print(f"  Loaded model successfully with {len(model_features)} features verified.", flush=True)
     
-    # ---------------------------------------------------------
     # 2. Stream & Index Target Records (Source 2 & Source 3)
-    # ---------------------------------------------------------
     print("\n2. Streaming & Indexing Target Records (Source 2 + Source 3)...", flush=True)
     t0 = time.time()
     
     blocker = InvertedIndexBlocker(max_key_frequency=500, max_candidates_per_s1=160)
     target_lookup_fast: Dict[str, PrecomputedEntity] = {}
     target_lookup_raw: Dict[str, Tuple[str, str, str, str]] = {}
-    
     total_targets = 0
     
     def process_target_file(filepath: Path, src_name: str):
@@ -150,33 +204,25 @@ def run_test_inference(
             enable_tfidf_name=True,
             enable_tfidf_addr=True,
             enable_tfidf_char=True,
-            top_k_per_view=30,
+            top_k_per_view=35,
             max_total_candidates=160,
         )
         retriever.fit_target_corpora(target_lookup_raw)
         print(f"  TF-IDF matrices fitted in {time.time() - t_ret:.2f}s", flush=True)
-        # Free raw lookup to conserve RAM
         target_lookup_raw.clear()
         gc.collect()
 
-    # Pre-extract target address components and frequency tracking if rich model
-    tgt_addr_comps = {}
-    freq_tracker = None
-    if is_rich_model:
-        print("  Extracting target address components & corpus frequency tracker...", flush=True)
-        t_ac = time.time()
-        tgt_addr_comps = {tid: extract_structured_address_components(e.norm_addr) for tid, e in target_lookup_fast.items()}
-        freq_tracker = CorpusFrequencyTracker()
-        all_tgt_names = [e.norm_name for e in target_lookup_fast.values()]
-        all_tgt_addrs = [e.norm_addr for e in target_lookup_fast.values()]
-        freq_tracker.fit(all_tgt_names, all_tgt_addrs)
-        print(f"  Target primitives prepared in {time.time() - t_ac:.2f}s", flush=True)
-        
+    print("  Extracting target address components & corpus frequency tracker...", flush=True)
+    t_ac = time.time()
+    tgt_addr_comps = {tid: extract_structured_address_components(e.norm_addr) for tid, e in target_lookup_fast.items()}
+    freq_tracker = CorpusFrequencyTracker()
+    all_tgt_names = [e.norm_name for e in target_lookup_fast.values()]
+    all_tgt_addrs = [e.norm_addr for e in target_lookup_fast.values()]
+    freq_tracker.fit(all_tgt_names, all_tgt_addrs)
+    print(f"  Target primitives prepared in {time.time() - t_ac:.2f}s", flush=True)
     gc.collect()
 
-    # ---------------------------------------------------------
     # 3. Process Source 1 in Chunks & Stream Results
-    # ---------------------------------------------------------
     matching_out_path = Path(output_dir) / "matching_results.tsv"
     candidate_out_path = Path(output_dir) / "candidate_pairs.tsv"
     
@@ -187,7 +233,6 @@ def run_test_inference(
     f_match = open(matching_out_path, "w", encoding="utf-8", newline="")
     f_cand = open(candidate_out_path, "w", encoding="utf-8", newline="")
     
-    # Write official headers
     f_match.write("source1_entity_id\tmatched_entity_ids\n")
     f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
     
@@ -233,9 +278,7 @@ def run_test_inference(
             "country": [r[3] for r in rows],
         })
         
-        # 1. Candidate Generation (Stage-5 Blocker + Multi-View TF-IDF Union)
         stage5_cands = blocker.generate_candidates_for_s1(df_chunk)
-        
         final_cands_dict: Dict[str, Set[str]] = {}
         ret_evidence_dict: Dict[str, Dict[str, Dict[str, float]]] = {}
         
@@ -250,52 +293,28 @@ def run_test_inference(
                 final_cands_dict[eid] = s5_set
                 ret_evidence_dict[eid] = {}
                 
-        # 2. Vectorized Feature Extraction
         feat_matrix_rows = []
         pair_meta = []
         
         for s1_id in s1_ids:
             s1_obj = s1_objects[s1_id]
-            s1_ac = extract_structured_address_components(s1_obj.norm_addr) if is_rich_model else None
+            s1_ac = extract_structured_address_components(s1_obj.norm_addr)
             cand_set = final_cands_dict.get(s1_id, set())
             c_len = len(cand_set)
             cand_counts_sample.append(c_len)
             total_candidate_pairs += c_len
             
             evid_map = ret_evidence_dict.get(s1_id, {})
-            
             for tid in cand_set:
                 tgt_obj = target_lookup_fast.get(tid)
                 if not tgt_obj:
                     continue
-                base_feats = extract_pairwise_features_fast(s1_obj, tgt_obj)
-                
-                if is_rich_model:
-                    tgt_ac = tgt_addr_comps.get(tid, extract_structured_address_components(""))
-                    ac_feats = compute_address_component_features(s1_ac, tgt_ac)
-                    s1_nf = freq_tracker.get_name_freq_feature(s1_obj.norm_name)
-                    tgt_nf = freq_tracker.get_name_freq_feature(tgt_obj.norm_name)
-                    s1_af = freq_tracker.get_addr_freq_feature(s1_obj.norm_addr)
-                    tgt_af = freq_tracker.get_addr_freq_feature(tgt_obj.norm_addr)
-                    
-                    evid = evid_map.get(tid, {})
-                    ret_views = float(len(evid)) if evid else 1.0
-                    max_tfidf = max([v for k, v in evid.items() if k != "blocking"], default=0.0)
-                    
-                    full_row = base_feats + [
-                        ac_feats["addr_hnum_match"], ac_feats["addr_hnum_conflict"],
-                        ac_feats["addr_postal_match"], ac_feats["addr_postal_conflict"],
-                        ac_feats["addr_digits_overlap"], ac_feats["addr_digits_conflict"],
-                        s1_nf, tgt_nf, s1_af, tgt_af,
-                        ret_views, max_tfidf,
-                    ]
-                    feat_matrix_rows.append(full_row)
-                else:
-                    feat_matrix_rows.append(base_feats)
-                    
+                tgt_ac = tgt_addr_comps.get(tid, extract_structured_address_components(""))
+                evid = evid_map.get(tid, {})
+                full_row = extract_v1_1_features(s1_obj, tgt_obj, s1_ac, tgt_ac, freq_tracker, evid)
+                feat_matrix_rows.append(full_row)
                 pair_meta.append((s1_id, tid))
                 
-        # 3. Model Prediction
         pair_prob_dict = defaultdict(list)
         if feat_matrix_rows:
             X_chunk = np.array(feat_matrix_rows, dtype=np.float32)
@@ -303,10 +322,8 @@ def run_test_inference(
             for (s1_id, tid), prob in zip(pair_meta, probs):
                 pair_prob_dict[s1_id].append((tid, float(prob)))
                 
-        # 4. Post-Processing Decision Layer (Singleton Guard + Global Consistency)
         final_matched_dict = postprocessor.apply(s1_ids, pair_prob_dict, final_cands_dict)
         
-        # 5. Write Results Incrementally
         for s1_id in s1_ids:
             cand_set = final_cands_dict.get(s1_id, set())
             matched_set = final_matched_dict.get(s1_id, set())
@@ -323,7 +340,6 @@ def run_test_inference(
                 total_predicted_matches += len(matched_set)
                 
         total_s1_processed += len(s1_ids)
-        
         elapsed = time.time() - t_inference_start
         rate = total_s1_processed / elapsed if elapsed > 0 else 0.0
         if chunk_idx % 10 == 0 or total_s1_processed == len(rows):
@@ -331,7 +347,6 @@ def run_test_inference(
             f_match.flush()
             f_cand.flush()
 
-    # Read Source 1 line by line
     with open(source1_file, "r", encoding="utf-8") as f:
         f.readline()  # Skip header
         for line in f:
@@ -372,7 +387,7 @@ def run_test_inference(
     max_cand = int(np.max(cand_arr))
     
     print("\n" + "=" * 75, flush=True)
-    print("INFERENCE SUMMARY:", flush=True)
+    print("V1.1 INFERENCE SUMMARY:", flush=True)
     print(f"  S1 Records Processed:      {total_s1_processed:,}", flush=True)
     print(f"  Total Candidate Pairs:     {total_candidate_pairs:,}", flush=True)
     print(f"  Average Candidates / S1:   {avg_cand:.2f}", flush=True)
@@ -388,11 +403,11 @@ def run_test_inference(
     print("=" * 75, flush=True)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Production Test Inference for Entity Resolution")
+    parser = argparse.ArgumentParser(description="Production Test Inference for Entity Resolution (V1.1 Final)")
     parser.add_argument("--test-dir", default="dataset/test", help="Path to test dataset directory")
     parser.add_argument("--output-dir", default="outputs", help="Output directory for results")
-    parser.add_argument("--model-path", default="models/lightgbm_v1_optimized.txt", help="Path to trained LightGBM model")
-    parser.add_argument("--threshold", type=float, default=0.960, help="Decision threshold for match prediction")
+    parser.add_argument("--model-path", default="models/lightgbm_v1_1_optimized.txt", help="Path to trained LightGBM model")
+    parser.add_argument("--threshold", type=float, default=0.950, help="Decision threshold for match prediction")
     parser.add_argument("--chunk-size", type=int, default=5000, help="Chunk size for S1 streaming")
     parser.add_argument("--max-s1", type=int, default=None, help="Maximum number of S1 entities to process (for dry-run)")
     parser.add_argument("--no-tfidf", action="store_true", help="Disable multi-view TF-IDF candidate retrieval")
