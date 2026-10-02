@@ -146,6 +146,12 @@ def process_microbatch_worker(args: Tuple[int, List[Tuple[str, str, str, str]]])
     Processes a single microbatch of S1 records in a worker process.
     Reads from G_* globals, returns compact string results.
     """
+    import psutil
+    try:
+        worker_start_rss = psutil.Process().memory_info().rss / (1024**3)
+    except Exception:
+        worker_start_rss = 0.0
+
     batch_idx, rows = args
     
     s1_ids = []
@@ -262,6 +268,11 @@ def process_microbatch_worker(args: Tuple[int, List[Tuple[str, str, str, str]]])
         else:
             total_empty += 1
 
+    try:
+        worker_end_rss = psutil.Process().memory_info().rss / (1024**3)
+    except Exception:
+        worker_end_rss = 0.0
+
     stats = {
         's1_count': len(s1_ids),
         'raw_cands': total_raw_cands,
@@ -269,7 +280,7 @@ def process_microbatch_worker(args: Tuple[int, List[Tuple[str, str, str, str]]])
         'matches': total_matches,
         'empty': total_empty,
         'worker_start_rss_gb': worker_start_rss,
-        'worker_end_rss_gb': psutil.Process().memory_info().rss / (1024**3),
+        'worker_end_rss_gb': worker_end_rss,
     }
 
     return (batch_idx, match_output, cand_output, stats)
