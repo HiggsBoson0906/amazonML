@@ -91,6 +91,51 @@ def init_worker():
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 
+def _worker_process_target_chunk(lines):
+    from src.normalize import normalize_business_name, extract_core_business_name, normalize_business_address
+    from src.blocking import InvertedIndexBlocker
+    from collections import defaultdict
+    
+    rt = {}
+    nc = defaultdict(int)
+    tc = defaultdict(int)
+    ac = defaultdict(int)
+    
+    blocker = InvertedIndexBlocker(max_key_frequency=500, max_candidates_per_s1=200)
+    idx = defaultdict(lambda: defaultdict(list))
+    
+    for line in lines:
+        parts = line.rstrip("\r\n").split("\t")
+        if len(parts) != 4: continue
+        tid = parts[0].strip()
+        if not tid: continue
+        name = parts[1].strip()
+        addr = parts[2].strip()
+        country = parts[3].strip()
+        
+        n_name = normalize_business_name(name)
+        c_name = extract_core_business_name(n_name)
+        n_addr = normalize_business_address(addr) if addr else ""
+        c = country.strip() if country else "UNKNOWN"
+        
+        rt[tid] = (n_name, c_name, n_addr, c)
+        if n_name:
+            nc[n_name] += 1
+            for t in set(n_name.split()):
+                tc[t] += 1
+        if n_addr:
+            ac[n_addr] += 1
+            
+        if country:
+            keys = blocker._extract_all_keys(n_name, c_name, n_addr, name)
+            c_idx = idx[c]
+            for k in keys:
+                c_idx[k].append(tid)
+            
+    out_idx = {c: dict(v) for c, v in idx.items()}
+    return (rt, dict(nc), dict(tc), dict(ac), out_idx, len(lines))
+
+
 def process_microbatch_worker(args: Tuple[int, List[Tuple[str, str, str, str]]]):
     """
     Processes a single microbatch of S1 records in a worker process.
@@ -287,49 +332,63 @@ def run_v2_inference(
     raw_targets: Dict[str, Tuple[str, str, str, str]] = {}
     total_targets = 0
 
-    def process_target_file(filepath: Path, src_name: str):
-        nonlocal total_targets
-        t_file = time.time()
-        count = 0
+    def read_tsv_chunks(filepath, chunk_size=200000):
         with open(filepath, "r", encoding="utf-8") as f:
             f.readline()
+            chunk = []
             for line in f:
-                parts = line.rstrip("\r\n").split(DELIM)
-                if len(parts) != 4:
-                    continue
-                tid, name, addr, country = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
-                if not tid:
-                    continue
+                chunk.append(line)
+                if len(chunk) >= chunk_size:
+                    yield chunk
+                    chunk = []
+            if chunk:
+                yield chunk
 
-                n_name = normalize_business_name(name)
-                c_name = extract_core_business_name(n_name)
-                n_addr = normalize_business_address(addr) if addr else ""
-
-                raw_targets[tid] = (n_name, c_name, n_addr, country)
-
-                if n_name:
-                    freq_tracker.name_counts[n_name] += 1
-                    for t in set(n_name.split()):
-                        freq_tracker.token_doc_counts[t] += 1
-                if n_addr:
-                    freq_tracker.addr_counts[n_addr] += 1
-                freq_tracker.total_docs += 1
-
-                if country:
-                    keys = blocker._extract_all_keys(n_name, c_name, n_addr, name)
-                    c_idx = blocker.index[country]
-                    for k in keys:
-                        c_idx[k].append(tid)
-
-                count += 1
-                total_targets += 1
+    if n_workers > 1:
+        print(f"  Using {n_workers} workers to parse targets...", flush=True)
+        ctx = mp.get_context("spawn" if sys.platform == "win32" else "fork")
+        pool = ctx.Pool(processes=n_workers)
+        results = []
+        for filepath in [source2_file, source3_file]:
+            if filepath.exists():
+                for chunk in read_tsv_chunks(filepath, chunk_size=200000):
+                    results.append(pool.apply_async(_worker_process_target_chunk, (chunk,)))
+        
+        for i, res in enumerate(results):
+            rt, nc, tc, ac, out_idx, count = res.get()
+            raw_targets.update(rt)
+            for k, v in nc.items(): freq_tracker.name_counts[k] += v
+            for k, v in tc.items(): freq_tracker.token_doc_counts[k] += v
+            for k, v in ac.items(): freq_tracker.addr_counts[k] += v
+            freq_tracker.total_docs += count
+            for c, keys in out_idx.items():
+                for k, tids in keys.items():
+                    blocker.index[c][k].extend(tids)
+            total_targets += count
+            if (i + 1) % max(1, len(results) // 10) == 0:
+                print(f"    Merged chunk {i+1}/{len(results)} ({total_targets:,} targets)...", flush=True)
+                
+        pool.close()
+        pool.join()
+    else:
+        for filepath in [source2_file, source3_file]:
+            if not filepath.exists(): continue
+            count = 0
+            for chunk in read_tsv_chunks(filepath, chunk_size=200000):
+                rt, nc, tc, ac, out_idx, c_cnt = _worker_process_target_chunk(chunk)
+                raw_targets.update(rt)
+                for k, v in nc.items(): freq_tracker.name_counts[k] += v
+                for k, v in tc.items(): freq_tracker.token_doc_counts[k] += v
+                for k, v in ac.items(): freq_tracker.addr_counts[k] += v
+                freq_tracker.total_docs += c_cnt
+                for c, keys in out_idx.items():
+                    for k, tids in keys.items():
+                        blocker.index[c][k].extend(tids)
+                count += c_cnt
+                total_targets += c_cnt
                 if count % 1000000 == 0:
-                    print(f"    {src_name}: {count:,}...", flush=True)
-        print(f"  {src_name}: {count:,} in {time.time() - t_file:.1f}s", flush=True)
-
-    process_target_file(source2_file, "S2")
-    process_target_file(source3_file, "S3")
-
+                    print(f"    {filepath.name}: {count:,}...", flush=True)
+        
     print(f"  Total: {total_targets:,} in {time.time() - t0:.1f}s", flush=True)
     blocker.prune_high_frequency_keys()
 
@@ -355,7 +414,7 @@ def run_v2_inference(
             top_k_per_view=45,
             max_total_candidates=200,
         )
-        retriever.fit_target_corpora(raw_targets)
+        retriever.fit_target_corpora(raw_targets, n_jobs=n_workers)
         print(f"  TF-IDF fitted in {time.time() - t_ret:.1f}s", flush=True)
 
     # Free raw_targets — TargetStore and TF-IDF have consumed the data

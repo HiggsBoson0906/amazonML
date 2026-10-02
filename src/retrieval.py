@@ -54,43 +54,63 @@ class MultiViewCandidateRetriever:
         # Country -> List of target IDs corresponding to matrix columns
         self.country_target_ids: Dict[str, List[str]] = defaultdict(list)
 
-    def fit_target_corpora(self, target_records: Dict[str, Tuple[str, str, str, str]]):
+    def fit_target_corpora(self, target_records: Dict[str, Tuple[str, str, str, str]], n_jobs: int = 1):
         """Fit TF-IDF vectorizers and transform target matrices partitioned by country.
         
         target_records: tid -> (norm_name, core_name, norm_addr, country)
         """
+        import concurrent.futures
+        
         # Index target IDs by country
         self.country_target_ids = defaultdict(list)
         for tid, (_, _, _, country) in target_records.items():
             c = country.strip() if country else "UNKNOWN"
             self.country_target_ids[c].append(tid)
             
-        for c, tids in self.country_target_ids.items():
-            if len(tids) == 0:
-                continue
+        def _fit_country(c, tids):
             names = [target_records[tid][0] or " " for tid in tids]
             addrs = [target_records[tid][2] or " " for tid in tids]
+            results = {}
             
             if self.enable_tfidf_name:
                 v_name = TfidfVectorizer(max_features=50000, token_pattern=r"(?u)\b\w+\b", dtype=np.float32)
-                M = v_name.fit_transform(names)
-                self.name_matrices[c] = M.T.tocsr()
-                self.name_vectorizers[c] = v_name
+                M_name = v_name.fit_transform(names)
+                results['name'] = (v_name, M_name.T.tocsr())
                 
             if self.enable_tfidf_addr:
                 v_addr = TfidfVectorizer(max_features=50000, token_pattern=r"(?u)\b\w+\b", dtype=np.float32)
-                M = v_addr.fit_transform(addrs)
-                self.addr_matrices[c] = M.T.tocsr()
-                self.addr_vectorizers[c] = v_addr
+                M_addr = v_addr.fit_transform(addrs)
+                results['addr'] = (v_addr, M_addr.T.tocsr())
                 
             if self.enable_tfidf_char:
                 v_char = TfidfVectorizer(analyzer="char", ngram_range=(3, 3), max_features=40000, dtype=np.float32)
-                M = v_char.fit_transform(names)
-                self.char_matrices[c] = M.T.tocsr()
-                self.char_vectorizers[c] = v_char
+                M_char = v_char.fit_transform(names)
+                results['char'] = (v_char, M_char.T.tocsr())
                 
-            names.clear()
-            addrs.clear()
+            return c, results
+
+        tasks = [(c, tids) for c, tids in self.country_target_ids.items() if len(tids) > 0]
+        
+        if n_jobs > 1:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=n_jobs) as executor:
+                futures = [executor.submit(_fit_country, c, tids) for c, tids in tasks]
+                for future in concurrent.futures.as_completed(futures):
+                    c, res = future.result()
+                    if 'name' in res:
+                        self.name_vectorizers[c], self.name_matrices[c] = res['name']
+                    if 'addr' in res:
+                        self.addr_vectorizers[c], self.addr_matrices[c] = res['addr']
+                    if 'char' in res:
+                        self.char_vectorizers[c], self.char_matrices[c] = res['char']
+        else:
+            for c, tids in tasks:
+                _, res = _fit_country(c, tids)
+                if 'name' in res:
+                    self.name_vectorizers[c], self.name_matrices[c] = res['name']
+                if 'addr' in res:
+                    self.addr_vectorizers[c], self.addr_matrices[c] = res['addr']
+                if 'char' in res:
+                    self.char_vectorizers[c], self.char_matrices[c] = res['char']
 
     def retrieve_candidates(
         self,
