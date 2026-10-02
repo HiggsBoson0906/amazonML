@@ -46,7 +46,6 @@ from collections import defaultdict
 
 import numpy as np
 import lightgbm as lgb
-import polars as pl
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -163,14 +162,14 @@ def process_microbatch_worker(args: Tuple[int, List[Tuple[str, str, str, str]]])
         s1_by_country[c].append((eid, nn, cn, na, country))
 
     # --- Candidate Generation ---
-    df_mb = pl.DataFrame({
+    df_mb = {
         "entity_id": s1_ids,
         "business_name": [r[1] for r in rows],
         "norm_name": [s1_prims[eid]['nn'] for eid in s1_ids],
         "core_name": [s1_prims[eid]['cn'] for eid in s1_ids],
         "norm_address": [s1_prims[eid]['na'] for eid in s1_ids],
         "country": [r[3] for r in rows],
-    })
+    }
 
     stage5_cands = G_BLOCKER.generate_candidates_for_s1(df_mb)
 

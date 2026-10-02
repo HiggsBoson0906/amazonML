@@ -1,6 +1,6 @@
 from collections import defaultdict
 from typing import Dict, List, Set, Tuple, Optional
-import polars as pl
+
 from tqdm import tqdm
 
 from src.normalize import (
@@ -138,7 +138,7 @@ class InvertedIndexBlocker:
 
     def add_target_records(
         self,
-        df: pl.DataFrame,
+        df: Any,
         id_col: str = "entity_id",
         name_col: str = "business_name",
         norm_name_col: str = "norm_name",
@@ -245,7 +245,7 @@ class InvertedIndexBlocker:
 
     def generate_candidates_for_s1(
         self,
-        df_s1: pl.DataFrame,
+        df_s1: Any,
         id_col: str = "entity_id",
         name_col: str = "business_name",
         norm_name_col: str = "norm_name",
@@ -253,12 +253,20 @@ class InvertedIndexBlocker:
         norm_addr_col: str = "norm_address",
         country_col: str = "country",
     ) -> Dict[str, Set[str]]:
-        ids = df_s1[id_col].to_list()
-        norm_names = df_s1[norm_name_col].to_list()
-        core_names = df_s1[core_name_col].to_list()
-        raw_names = df_s1[name_col].to_list() if name_col in df_s1.columns else [""] * len(ids)
-        norm_addrs = df_s1[norm_addr_col].to_list() if norm_addr_col in df_s1.columns else [""] * len(ids)
-        countries = df_s1[country_col].to_list()
+        if isinstance(df_s1, dict):
+            ids = df_s1.get(id_col, [])
+            norm_names = df_s1.get(norm_name_col, [])
+            core_names = df_s1.get(core_name_col, [])
+            raw_names = df_s1.get(name_col, [""] * len(ids))
+            norm_addrs = df_s1.get(norm_addr_col, [""] * len(ids))
+            countries = df_s1.get(country_col, [])
+        else:
+            ids = df_s1[id_col].to_list()
+            norm_names = df_s1[norm_name_col].to_list()
+            core_names = df_s1[core_name_col].to_list()
+            raw_names = df_s1[name_col].to_list() if name_col in df_s1.columns else [""] * len(ids)
+            norm_addrs = df_s1[norm_addr_col].to_list() if norm_addr_col in df_s1.columns else [""] * len(ids)
+            countries = df_s1[country_col].to_list()
         
         candidates: Dict[str, Set[str]] = {}
         
