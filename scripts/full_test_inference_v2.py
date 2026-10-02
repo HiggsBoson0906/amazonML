@@ -89,9 +89,6 @@ def init_worker():
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    
-    if G_MODEL is not None:
-        G_MODEL.set_num_threads(1)
 
 
 def process_microbatch_worker(args: Tuple[int, List[Tuple[str, str, str, str]]]):
@@ -180,7 +177,7 @@ def process_microbatch_worker(args: Tuple[int, List[Tuple[str, str, str, str]]])
     pair_results: Dict[str, List[dict]] = defaultdict(list)
     if feat_rows:
         X = np.array(feat_rows, dtype=np.float32)
-        probs = G_MODEL.predict(X)
+        probs = G_MODEL.predict(X, num_threads=1)
 
         for (s1_id, tid, njw, ajw, ec, ea, pm, hm), prob in zip(pair_meta, probs):
             pair_results[s1_id].append({
@@ -263,9 +260,10 @@ def run_v2_inference(
     os.makedirs(output_dir, exist_ok=True)
     test_path = Path(test_dir)
 
-    source1_file = test_path / "test_source1.tsv"
-    source2_file = test_path / "test_source2.tsv"
-    source3_file = test_path / "test_source3.tsv"
+    prefix = "train" if "train" in test_dir else "test"
+    source1_file = test_path / f"{prefix}_source1.tsv"
+    source2_file = test_path / f"{prefix}_source2.tsv"
+    source3_file = test_path / f"{prefix}_source3.tsv"
 
     # =========================================================================
     # 1. LOAD MODEL
