@@ -262,7 +262,9 @@ def process_microbatch_worker(args: Tuple[int, List[Tuple[str, str, str, str]]])
         'raw_cands': total_raw_cands,
         'stage_a_surv': total_stage_a_survivors,
         'matches': total_matches,
-        'empty': total_empty
+        'empty': total_empty,
+        'worker_start_rss_gb': worker_start_rss,
+        'worker_end_rss_gb': psutil.Process().memory_info().rss / (1024**3),
     }
 
     return (batch_idx, match_output, cand_output, stats)
@@ -281,12 +283,18 @@ def run_v2_inference(
     max_s1: Optional[int] = None,
     enable_tfidf: bool = True,
     enable_global_consistency: bool = True,
-    workers: str = "auto",
+    workers: str = "2",
 ):
     global G_MODEL, G_BLOCKER, G_FREQ_TRACKER, G_TARGET_STORE, G_RETRIEVER, G_STAGE_A_MAX, G_POSTPROCESSOR
 
-    if workers.lower() == "auto":
-        n_workers = os.cpu_count() or 1
+    if workers.lower() == "auto" or workers.lower() == "safe":
+        import psutil
+        total_gb = psutil.virtual_memory().total / (1024**3)
+        # Without gc.freeze() fully trusting COW, workers can take up to 11GB.
+        # So safe workers = total_gb / 12
+        safe_workers = max(1, int(total_gb // 12))
+        n_workers = min(safe_workers, os.cpu_count() or 1)
+        print(f"  [!] Auto-scaling workers safely to {n_workers} based on {total_gb:.1f} GB RAM.", flush=True)
     else:
         n_workers = int(workers)
 
@@ -437,8 +445,11 @@ def run_v2_inference(
 
     try:
         import psutil
+        import gc
+        # gc.freeze() could prevent GC from dirtying COW pages
+        gc.freeze()
         rss_gb = psutil.Process().memory_info().rss / (1024**3)
-        print(f"  [✓] Init complete (raw_targets freed). RSS: {rss_gb:.2f} GB", flush=True)
+        print(f"  [✓] Init complete (raw_targets freed). Parent RSS: {rss_gb:.2f} GB", flush=True)
     except Exception:
         print("  [✓] Init complete.", flush=True)
 
@@ -449,6 +460,8 @@ def run_v2_inference(
     candidate_out = Path(output_dir) / "candidate_pairs.tsv"
 
     print(f"\n3. Inference (Stage-A → Stage-B → Postprocess)...", flush=True)
+    import multiprocessing
+    print(f"  [Diagnostics] multiprocessing start method: {multiprocessing.get_start_method()}", flush=True)
 
     f_match = open(matching_out, "w", encoding="utf-8", newline="")
     f_cand = open(candidate_out, "w", encoding="utf-8", newline="")
