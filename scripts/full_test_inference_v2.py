@@ -29,6 +29,12 @@ PRESERVED:
 """
 
 import os
+# Must be set before importing numpy/scipy/lightgbm to prevent thread thrashing
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 import sys
 import time
 import gc
