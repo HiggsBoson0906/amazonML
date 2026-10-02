@@ -5,38 +5,27 @@ V2 Production Inference Pipeline — Amazon ML Challenge 2026
 Architecture redesign for 100x+ wall-clock speedup over V1.3:
 
 KEY OPTIMIZATIONS:
-1. COLUMNAR TARGET STORE: All target-side data stored in arrays/lists (TargetStore).
+1. MULTIPROCESSING: Dynamic CPU detection. Scales across all vCPUs using
+   Linux fork copy-on-write. Zero memory duplication of target structures.
+2. COLUMNAR TARGET STORE: All target-side data stored in arrays/lists (TargetStore).
    No per-chunk OptimizedEntity construction. ~2-3 GB instead of 50+ GB.
-
-2. TWO-STAGE RANKING:
+3. TWO-STAGE RANKING:
    Stage A: Ultra-cheap filter using token Jaccard, n-gram overlap, country/postal.
             Reduces ~100-200 candidates to ~15-50 survivors. Zero RapidFuzz calls.
    Stage B: Full 50-feature LightGBM scoring only on survivors.
-
-3. LAZY TARGET PRIMITIVE CREATION: Full dict-primitives only built for Stage-B
+4. LAZY TARGET PRIMITIVE CREATION: Full dict-primitives only built for Stage-B
    survivors (~15-50 per S1), not for all ~200 candidates.
-
-4. ELIMINATED REDUNDANT COMPUTATION:
+5. ELIMINATED REDUNDANT COMPUTATION:
    - Postprocessor reuses JW scores from feature extraction
    - No re-creation of OptimizedEntity objects per chunk
    - frozenset ops instead of repeated set() construction
-
-5. MICROBATCHING: 500 S1 per microbatch, immediately postprocessed and written.
-   No accumulation of millions of pair objects.
-
-6. STREAMING OUTPUT: Results written per-microbatch.
+6. MICROBATCHING: 500 S1 per microbatch, distributed to workers.
+7. STREAMING OUTPUT: Results written per-microbatch in order.
 
 PRESERVED:
 - All 50 LightGBM features (exact numerical fidelity)
 - V1.3 surgical postprocessing (thresholds, guards, consistency)
 - Same output format (matching_results.tsv, candidate_pairs.tsv)
-
-EXPECTED SPEEDUP BREAKDOWN (vs V1.3 at ~0.9 S1/s):
-- Stage A eliminates ~70-80% of expensive pair evaluations → 3-5x
-- No per-chunk OptimizedEntity construction → 2-3x
-- No redundant JW in postprocessor → 1.2x  
-- Short-circuit on exact matches → 1.3x
-- Combined: ~10-20x minimum → ~10-50+ S1/sec expected
 """
 
 import os
@@ -44,12 +33,14 @@ import sys
 import time
 import gc
 import argparse
+import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional, Any
 from collections import defaultdict
 
 import numpy as np
 import lightgbm as lgb
+import polars as pl
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -79,6 +70,162 @@ from src.postprocess_v2 import PostProcessorV2
 DELIM = "\t"
 
 
+# =========================================================================
+# GLOBAL READ-ONLY STATE FOR WORKERS
+# =========================================================================
+# On Linux, these are inherited via fork() copy-on-write, consuming 0 extra RAM.
+G_MODEL = None
+G_BLOCKER = None
+G_FREQ_TRACKER = None
+G_TARGET_STORE = None
+G_RETRIEVER = None
+G_STAGE_A_MAX = 50
+G_POSTPROCESSOR = None
+
+
+def init_worker():
+    """Worker initialization: ensure single-threaded execution for LightGBM and BLAS."""
+    # Prevent hidden thread pools from oversubscribing the machine
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    
+    if G_MODEL is not None:
+        G_MODEL.set_num_threads(1)
+
+
+def process_microbatch_worker(args: Tuple[int, List[Tuple[str, str, str, str]]]):
+    """
+    Processes a single microbatch of S1 records in a worker process.
+    Reads from G_* globals, returns compact string results.
+    """
+    batch_idx, rows = args
+    
+    s1_ids = []
+    s1_prims: Dict[str, dict] = {}
+    s1_by_country = defaultdict(list)
+
+    for eid, name, addr, country in rows:
+        s1_ids.append(eid)
+        nn = normalize_business_name(name)
+        cn = extract_core_business_name(nn)
+        na = normalize_business_address(addr) if addr else ""
+        s1_prims[eid] = make_s1_primitives(nn, cn, na, country, G_FREQ_TRACKER)
+        c = country.strip() if country else "UNKNOWN"
+        s1_by_country[c].append((eid, nn, cn, na, country))
+
+    # --- Candidate Generation ---
+    df_mb = pl.DataFrame({
+        "entity_id": s1_ids,
+        "business_name": [r[1] for r in rows],
+        "norm_name": [s1_prims[eid]['nn'] for eid in s1_ids],
+        "core_name": [s1_prims[eid]['cn'] for eid in s1_ids],
+        "norm_address": [s1_prims[eid]['na'] for eid in s1_ids],
+        "country": [r[3] for r in rows],
+    })
+
+    stage5_cands = G_BLOCKER.generate_candidates_for_s1(df_mb)
+
+    if G_RETRIEVER is not None:
+        final_cands, ret_evidence = G_RETRIEVER.retrieve_candidates_batch(
+            s1_by_country=s1_by_country,
+            blocking_cands_map=stage5_cands,
+        )
+    else:
+        final_cands = stage5_cands
+        ret_evidence = {}
+
+    # --- Stage A + Stage B ---
+    feat_rows = []
+    pair_meta = []
+    total_raw_cands = 0
+    total_stage_a_survivors = 0
+
+    for s1_id in s1_ids:
+        sp = s1_prims[s1_id]
+        cand_set = final_cands.get(s1_id, set())
+        total_raw_cands += len(cand_set)
+
+        evid_s1 = ret_evidence.get(s1_id, {})
+
+        # STAGE A: Cheap pre-filter
+        survivors = filter_candidates_stage_a(
+            sp['nn'], sp['cn'], sp['na'], sp['ct'],
+            sp['ct_f'], sp['ng3'], sp['pc'], sp['hn'],
+            cand_set, G_TARGET_STORE, evid_s1,
+            max_survivors=G_STAGE_A_MAX,
+        )
+        total_stage_a_survivors += len(survivors)
+
+        # STAGE B: Full 50-feature extraction
+        for tid, sa_score in survivors:
+            tgt_p = G_TARGET_STORE.get_primitives(tid)
+            if tgt_p is None:
+                continue
+            evid = evid_s1.get(tid, {})
+            feat_vec = extract_ultra_features_v2(sp, tgt_p, G_FREQ_TRACKER, evid)
+            feat_rows.append(feat_vec)
+
+            pair_meta.append((
+                s1_id, tid,
+                feat_vec[37],  # name_jw
+                feat_vec[39],  # addr_jw
+                feat_vec[1] > 0.5,   # exact_core_name
+                feat_vec[14] > 0.5,  # addr_exact
+                feat_vec[27] > 0.5,  # addr_postal_match
+                feat_vec[25] > 0.5,  # addr_hnum_match
+            ))
+
+    # --- LightGBM Batch Prediction ---
+    pair_results: Dict[str, List[dict]] = defaultdict(list)
+    if feat_rows:
+        X = np.array(feat_rows, dtype=np.float32)
+        probs = G_MODEL.predict(X)
+
+        for (s1_id, tid, njw, ajw, ec, ea, pm, hm), prob in zip(pair_meta, probs):
+            pair_results[s1_id].append({
+                'tid': tid,
+                'prob': float(prob),
+                'name_jw': njw,
+                'addr_jw': ajw,
+                'exact_core': ec,
+                'exact_addr': ea,
+                'postal_match': pm,
+                'hnum_match': hm,
+            })
+
+    # --- V1.3 Postprocessing ---
+    final_matched = G_POSTPROCESSOR.apply(s1_ids, pair_results)
+
+    # --- Prepare Return Data (Compact Strings) ---
+    match_output = []
+    cand_output = []
+    total_matches = 0
+    total_empty = 0
+
+    for s1_id in s1_ids:
+        cand_set = final_cands.get(s1_id, set())
+        matched_set = final_matched.get(s1_id, set())
+
+        cand_output.append(f"{s1_id}\t{','.join(sorted(cand_set))}\n")
+        match_output.append(f"{s1_id}\t{','.join(sorted(matched_set))}\n")
+
+        if matched_set:
+            total_matches += len(matched_set)
+        else:
+            total_empty += 1
+
+    stats = {
+        's1_count': len(s1_ids),
+        'raw_cands': total_raw_cands,
+        'stage_a_surv': total_stage_a_survivors,
+        'matches': total_matches,
+        'empty': total_empty
+    }
+
+    return (batch_idx, match_output, cand_output, stats)
+
+
 def run_v2_inference(
     test_dir: str = "dataset/test",
     output_dir: str = "outputs",
@@ -92,17 +239,23 @@ def run_v2_inference(
     max_s1: Optional[int] = None,
     enable_tfidf: bool = True,
     enable_global_consistency: bool = True,
+    workers: str = "auto",
 ):
+    global G_MODEL, G_BLOCKER, G_FREQ_TRACKER, G_TARGET_STORE, G_RETRIEVER, G_STAGE_A_MAX, G_POSTPROCESSOR
+
+    if workers.lower() == "auto":
+        n_workers = os.cpu_count() or 1
+    else:
+        n_workers = int(workers)
+
     print("=" * 80, flush=True)
     print("V2 PRODUCTION INFERENCE — AMAZON ML CHALLENGE 2026", flush=True)
     print("=" * 80, flush=True)
     print(f"  Test Directory:         {test_dir}", flush=True)
     print(f"  Output Directory:       {output_dir}", flush=True)
     print(f"  Model:                  {model_path}", flush=True)
-    print(f"  Threshold:              {threshold:.3f}", flush=True)
+    print(f"  Workers:                {n_workers} (Detected: {os.cpu_count()})", flush=True)
     print(f"  Microbatch Size:        {microbatch_size}", flush=True)
-    print(f"  Stage-A Max Survivors:  {stage_a_max_survivors}", flush=True)
-    print(f"  Stage-A Threshold:      {STAGE_A_THRESHOLD}", flush=True)
     print(f"  Max S1:                 {'ALL' if max_s1 is None else f'{max_s1:,}'}", flush=True)
     print("=" * 80, flush=True)
 
@@ -122,10 +275,8 @@ def run_v2_inference(
         raise FileNotFoundError(f"Model not found: {model_path}")
 
     model = lgb.Booster(model_file=str(model_path))
-    n_model_features = len(model.feature_name())
-    assert n_model_features == len(ULTRA_FEATURE_COLS), \
-        f"Feature count mismatch: model={n_model_features}, expected={len(ULTRA_FEATURE_COLS)}"
-    print(f"  [✓] Model loaded: {n_model_features} features.", flush=True)
+    G_MODEL = model
+    print(f"  [✓] Model loaded: {len(model.feature_name())} features.", flush=True)
 
     # =========================================================================
     # 2. STREAM & INDEX TARGETS
@@ -191,13 +342,6 @@ def run_v2_inference(
     target_store = TargetStore()
     target_store.build(raw_targets, freq_tracker)
 
-    try:
-        import psutil
-        rss_gb = psutil.Process().memory_info().rss / (1024**3)
-        print(f"  RSS after TargetStore: {rss_gb:.2f} GB", flush=True)
-    except ImportError:
-        pass
-
     # =========================================================================
     # 2c. FIT TF-IDF RETRIEVER
     # =========================================================================
@@ -219,13 +363,27 @@ def run_v2_inference(
     # Free raw_targets — TargetStore and TF-IDF have consumed the data
     del raw_targets
     gc.collect()
-    
+
+    # Bind to globals for fork()
+    G_BLOCKER = blocker
+    G_FREQ_TRACKER = freq_tracker
+    G_TARGET_STORE = target_store
+    G_RETRIEVER = retriever
+    G_STAGE_A_MAX = stage_a_max_survivors
+    G_POSTPROCESSOR = PostProcessorV2(
+        base_threshold=threshold,
+        s_guard=s_guard,
+        min_margin=min_margin,
+        joint_sim_floor=joint_sim_floor,
+        enable_global_consistency=enable_global_consistency,
+    )
+
     try:
+        import psutil
         rss_gb = psutil.Process().memory_info().rss / (1024**3)
         print(f"  [✓] Init complete (raw_targets freed). RSS: {rss_gb:.2f} GB", flush=True)
     except Exception:
         print("  [✓] Init complete.", flush=True)
-    gc.collect()
 
     # =========================================================================
     # 3. STREAMING INFERENCE
@@ -240,182 +398,96 @@ def run_v2_inference(
     f_match.write("source1_entity_id\tmatched_entity_ids\n")
     f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
 
-    postprocessor = PostProcessorV2(
-        base_threshold=threshold,
-        s_guard=s_guard,
-        min_margin=min_margin,
-        joint_sim_floor=joint_sim_floor,
-        enable_global_consistency=enable_global_consistency,
-    )
+    def batch_generator():
+        chunk_rows = []
+        batch_idx = 0
+        with open(source1_file, "r", encoding="utf-8") as f:
+            f.readline()
+            for line in f:
+                parts = line.rstrip("\r\n").split(DELIM)
+                if len(parts) != 4:
+                    continue
+                eid, name, addr, country = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
+                if not eid:
+                    continue
+                
+                chunk_rows.append((eid, name, addr, country))
 
+                if len(chunk_rows) >= microbatch_size:
+                    yield (batch_idx, chunk_rows)
+                    batch_idx += 1
+                    chunk_rows = []
+                    
+                if max_s1 is not None and (batch_idx * microbatch_size + len(chunk_rows)) >= max_s1:
+                    break
+
+            if chunk_rows:
+                yield (batch_idx, chunk_rows)
+
+    t_inf = time.time()
+    
     total_s1 = 0
     total_raw_cands = 0
     total_stage_a_survivors = 0
     total_matches = 0
     total_empty = 0
-    t_inf = time.time()
 
-    import polars as pl
+    # Ensure parent process also limits LightGBM threads if we fall back to sequential
+    init_worker()
 
-    def process_microbatch(rows: List[Tuple[str, str, str, str]]):
-        nonlocal total_s1, total_raw_cands, total_stage_a_survivors, total_matches, total_empty
+    if n_workers > 1 and sys.platform != "win32":
+        # Linux / MacOS: Safe to fork with copy-on-write
+        ctx = mp.get_context("fork")
+        pool = ctx.Pool(processes=n_workers, initializer=init_worker)
+        iterator = pool.imap(process_microbatch_worker, batch_generator())
+    elif n_workers > 1 and sys.platform == "win32":
+        print("  [!] WARNING: Multiprocessing on Windows uses spawn. Bypassing parallel execution for local testing.", flush=True)
+        print("  [!] (On Linux/EC2, this will use fork and utilize all cores).", flush=True)
+        iterator = map(process_microbatch_worker, batch_generator())
+        pool = None
+    else:
+        # Sequential
+        iterator = map(process_microbatch_worker, batch_generator())
+        pool = None
 
-        s1_ids = []
-        s1_prims: Dict[str, dict] = {}
-        s1_by_country = defaultdict(list)
-
-        for eid, name, addr, country in rows:
-            s1_ids.append(eid)
-            nn = normalize_business_name(name)
-            cn = extract_core_business_name(nn)
-            na = normalize_business_address(addr) if addr else ""
-            s1_prims[eid] = make_s1_primitives(nn, cn, na, country, freq_tracker)
-            c = country.strip() if country else "UNKNOWN"
-            s1_by_country[c].append((eid, nn, cn, na, country))
-
-        # --- Candidate Generation ---
-        df_mb = pl.DataFrame({
-            "entity_id": s1_ids,
-            "business_name": [r[1] for r in rows],
-            "norm_name": [s1_prims[eid]['nn'] for eid in s1_ids],
-            "core_name": [s1_prims[eid]['cn'] for eid in s1_ids],
-            "norm_address": [s1_prims[eid]['na'] for eid in s1_ids],
-            "country": [r[3] for r in rows],
-        })
-
-        stage5_cands = blocker.generate_candidates_for_s1(df_mb)
-
-        if retriever is not None:
-            final_cands, ret_evidence = retriever.retrieve_candidates_batch(
-                s1_by_country=s1_by_country,
-                blocking_cands_map=stage5_cands,
-            )
-        else:
-            final_cands = stage5_cands
-            ret_evidence = {}
-
-        # --- Stage A + Stage B ---
-        feat_rows = []
-        pair_meta = []
-
-        for s1_id in s1_ids:
-            sp = s1_prims[s1_id]
-            cand_set = final_cands.get(s1_id, set())
-            total_raw_cands += len(cand_set)
-
-            evid_s1 = ret_evidence.get(s1_id, {})
-
-            # STAGE A: Cheap pre-filter (NO RapidFuzz, NO LCS, NO heavyweight objects)
-            survivors = filter_candidates_stage_a(
-                sp['nn'], sp['cn'], sp['na'], sp['ct'],
-                sp['ct_f'], sp['ng3'], sp['pc'], sp['hn'],
-                cand_set, target_store, evid_s1,
-                max_survivors=stage_a_max_survivors,
-            )
-            total_stage_a_survivors += len(survivors)
-
-            # STAGE B: Full 50-feature extraction — only for survivors
-            for tid, sa_score in survivors:
-                tgt_p = target_store.get_primitives(tid)
-                if tgt_p is None:
-                    continue
-                evid = evid_s1.get(tid, {})
-                feat_vec = extract_ultra_features_v2(sp, tgt_p, freq_tracker, evid)
-                feat_rows.append(feat_vec)
-
-                # Cache postprocessor values (indices from ULTRA_FEATURE_COLS)
-                pair_meta.append((
-                    s1_id, tid,
-                    feat_vec[37],  # name_jw
-                    feat_vec[39],  # addr_jw
-                    feat_vec[1] > 0.5,   # exact_core_name
-                    feat_vec[14] > 0.5,  # addr_exact
-                    feat_vec[27] > 0.5,  # addr_postal_match
-                    feat_vec[25] > 0.5,  # addr_hnum_match
-                ))
-
-        # --- LightGBM Batch Prediction ---
-        pair_results: Dict[str, List[dict]] = defaultdict(list)
-        if feat_rows:
-            X = np.array(feat_rows, dtype=np.float32)
-            probs = model.predict(X)
-
-            for (s1_id, tid, njw, ajw, ec, ea, pm, hm), prob in zip(pair_meta, probs):
-                pair_results[s1_id].append({
-                    'tid': tid,
-                    'prob': float(prob),
-                    'name_jw': njw,
-                    'addr_jw': ajw,
-                    'exact_core': ec,
-                    'exact_addr': ea,
-                    'postal_match': pm,
-                    'hnum_match': hm,
-                })
-
-        # --- V1.3 Postprocessing ---
-        final_matched = postprocessor.apply(s1_ids, pair_results)
-
-        # --- Write Output ---
-        for s1_id in s1_ids:
-            cand_set = final_cands.get(s1_id, set())
-            matched_set = final_matched.get(s1_id, set())
-
-            f_cand.write(f"{s1_id}\t{','.join(sorted(cand_set))}\n")
-            f_match.write(f"{s1_id}\t{','.join(sorted(matched_set))}\n")
-
-            if matched_set:
-                total_matches += len(matched_set)
-            else:
-                total_empty += 1
-
-        total_s1 += len(s1_ids)
-
-    # --- Main Loop ---
-    chunk_rows = []
     report_interval = max(microbatch_size * 20, 5000)
 
-    with open(source1_file, "r", encoding="utf-8") as f:
-        f.readline()
-        for line in f:
-            parts = line.rstrip("\r\n").split(DELIM)
-            if len(parts) != 4:
-                continue
-            eid, name, addr, country = parts[0].strip(), parts[1].strip(), parts[2].strip(), parts[3].strip()
-            if not eid:
-                continue
-            chunk_rows.append((eid, name, addr, country))
+    try:
+        for batch_idx, match_output, cand_output, stats in iterator:
+            # Write results (imap ensures order)
+            f_match.writelines(match_output)
+            f_cand.writelines(cand_output)
 
-            if len(chunk_rows) >= microbatch_size:
-                process_microbatch(chunk_rows)
-                chunk_rows = []
+            # Update stats
+            total_s1 += stats['s1_count']
+            total_raw_cands += stats['raw_cands']
+            total_stage_a_survivors += stats['stage_a_surv']
+            total_matches += stats['matches']
+            total_empty += stats['empty']
 
-                if total_s1 % report_interval == 0:
-                    elapsed = time.time() - t_inf
-                    rate = total_s1 / elapsed if elapsed > 0 else 0.0
-                    avg_cands = total_raw_cands / total_s1 if total_s1 else 0
-                    avg_surv = total_stage_a_survivors / total_s1 if total_s1 else 0
-                    try:
-                        rss = psutil.Process().memory_info().rss / (1024**3)
-                        rss_str = f"{rss:.1f}GB"
-                    except Exception:
-                        rss_str = "N/A"
-                    print(
-                        f"    {total_s1:>9,d} S1 | {rate:>7.1f} S1/s | "
-                        f"cands: {avg_cands:.0f}→{avg_surv:.1f} | "
-                        f"matches: {total_matches:,} | RSS: {rss_str} | {elapsed:.0f}s",
-                        flush=True,
-                    )
-                    f_match.flush()
-                    f_cand.flush()
-
-            if max_s1 is not None and total_s1 + len(chunk_rows) >= max_s1:
-                if chunk_rows:
-                    process_microbatch(chunk_rows)
-                    chunk_rows = []
-                break
-
-    if chunk_rows:
-        process_microbatch(chunk_rows)
+            if total_s1 % report_interval == 0 or total_s1 == max_s1:
+                elapsed = time.time() - t_inf
+                rate = total_s1 / elapsed if elapsed > 0 else 0.0
+                avg_cands = total_raw_cands / total_s1 if total_s1 else 0
+                avg_surv = total_stage_a_survivors / total_s1 if total_s1 else 0
+                try:
+                    rss = psutil.Process().memory_info().rss / (1024**3)
+                    rss_str = f"{rss:.1f}GB"
+                except Exception:
+                    rss_str = "N/A"
+                print(
+                    f"    {total_s1:>9,d} S1 | {rate:>7.1f} S1/s | "
+                    f"cands: {avg_cands:.0f}→{avg_surv:.1f} | "
+                    f"matches: {total_matches:,} | RSS: {rss_str} | {elapsed:.0f}s",
+                    flush=True,
+                )
+                f_match.flush()
+                f_cand.flush()
+                
+    finally:
+        if pool is not None:
+            pool.close()
+            pool.join()
 
     f_match.close()
     f_cand.close()
@@ -464,6 +536,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-s1", type=int, default=None)
     parser.add_argument("--disable-tfidf", action="store_true")
     parser.add_argument("--disable-global-consistency", action="store_true")
+    parser.add_argument("--workers", type=str, default="auto", help="auto, or int (e.g. 8)")
     args = parser.parse_args()
 
     run_v2_inference(
@@ -479,4 +552,5 @@ if __name__ == "__main__":
         max_s1=args.max_s1,
         enable_tfidf=not args.disable_tfidf,
         enable_global_consistency=not args.disable_global_consistency,
+        workers=args.workers,
     )
