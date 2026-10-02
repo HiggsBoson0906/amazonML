@@ -451,7 +451,6 @@ def run_v2_inference(
 
     try:
         import psutil
-        import gc
         # gc.freeze() could prevent GC from dirtying COW pages
         gc.freeze()
         rss_gb = psutil.Process().memory_info().rss / (1024**3)
