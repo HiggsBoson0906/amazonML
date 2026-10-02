@@ -5,10 +5,27 @@ import numpy as np
 import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+def _extract_sparse_topk(sims: sp.csr_matrix, k: int, min_score: float) -> List[Tuple[int, float]]:
+    data = sims.data
+    if len(data) == 0:
+        return []
+    indices = sims.indices
+    mask = data > min_score
+    if not np.any(mask):
+        return []
+    val_d = data[mask]
+    val_i = indices[mask]
+    n_val = len(val_d)
+    if n_val <= k:
+        top_order = np.argsort(-val_d, kind='stable')
+    else:
+        top_part = np.argpartition(-val_d, k)[:k]
+        top_order = top_part[np.argsort(-val_d[top_part], kind='stable')]
+    return [(int(val_i[i]), float(val_d[i])) for i in top_order]
+
 class MultiViewCandidateRetriever:
     """Multi-view candidate retrieval engine combining Stage-5 InvertedIndexBlocking
-
-    with sparse TF-IDF and char-ngram vector spaces.
+    with high-speed sparse TF-IDF and char-ngram vector spaces.
     """
     def __init__(
         self,
@@ -26,7 +43,7 @@ class MultiViewCandidateRetriever:
         self.top_k_per_view = top_k_per_view
         self.max_total_candidates = max_total_candidates
         
-        # Country -> Vectorizer & Matrix
+        # Country -> Vectorizer & Transposed CSR Matrix (V x N)
         self.name_vectorizers: Dict[str, TfidfVectorizer] = {}
         self.name_matrices: Dict[str, sp.csr_matrix] = {}
         self.addr_vectorizers: Dict[str, TfidfVectorizer] = {}
@@ -34,12 +51,11 @@ class MultiViewCandidateRetriever:
         self.char_vectorizers: Dict[str, TfidfVectorizer] = {}
         self.char_matrices: Dict[str, sp.csr_matrix] = {}
         
-        # Country -> List of target IDs corresponding to matrix rows
+        # Country -> List of target IDs corresponding to matrix columns
         self.country_target_ids: Dict[str, List[str]] = defaultdict(list)
 
     def fit_target_corpora(self, target_records: Dict[str, Tuple[str, str, str, str]]):
         """Fit TF-IDF vectorizers and transform target matrices partitioned by country.
-
         
         target_records: tid -> (norm_name, core_name, norm_addr, country)
         """
@@ -57,17 +73,20 @@ class MultiViewCandidateRetriever:
             
             if self.enable_tfidf_name:
                 v_name = TfidfVectorizer(max_features=50000, token_pattern=r"(?u)\b\w+\b", dtype=np.float32)
-                self.name_matrices[c] = v_name.fit_transform(names).tocsr()
+                M = v_name.fit_transform(names)
+                self.name_matrices[c] = M.T.tocsr()
                 self.name_vectorizers[c] = v_name
                 
             if self.enable_tfidf_addr:
                 v_addr = TfidfVectorizer(max_features=50000, token_pattern=r"(?u)\b\w+\b", dtype=np.float32)
-                self.addr_matrices[c] = v_addr.fit_transform(addrs).tocsr()
+                M = v_addr.fit_transform(addrs)
+                self.addr_matrices[c] = M.T.tocsr()
                 self.addr_vectorizers[c] = v_addr
                 
             if self.enable_tfidf_char:
                 v_char = TfidfVectorizer(analyzer="char", ngram_range=(3, 3), max_features=40000, dtype=np.float32)
-                self.char_matrices[c] = v_char.fit_transform(names).tocsr()
+                M = v_char.fit_transform(names)
+                self.char_matrices[c] = M.T.tocsr()
                 self.char_vectorizers[c] = v_char
                 
             names.clear()
@@ -103,45 +122,36 @@ class MultiViewCandidateRetriever:
             v_name = self.name_vectorizers[c]
             q_vec = v_name.transform([n_name])
             if q_vec.nnz > 0:
-                sims = self.name_matrices[c].dot(q_vec.T).toarray().ravel()
-                top_idx = np.argsort(-sims, kind='stable')[:k]
-                for idx in top_idx:
-                    score = float(sims[idx])
-                    if score > 0.15:
-                        tid = tids[idx]
-                        evidence[tid]["tfidf_name"] = score
-                        if len(cand_set) < self.max_total_candidates:
-                            cand_set.add(tid)
+                sims = q_vec.dot(self.name_matrices[c])
+                for idx, score in _extract_sparse_topk(sims, k, 0.15):
+                    tid = tids[idx]
+                    evidence[tid]["tfidf_name"] = score
+                    if len(cand_set) < self.max_total_candidates:
+                        cand_set.add(tid)
                             
         # 2. Address TF-IDF Top-K
         if self.enable_tfidf_addr and c in self.addr_vectorizers and n_addr:
             v_addr = self.addr_vectorizers[c]
             q_vec = v_addr.transform([n_addr])
             if q_vec.nnz > 0:
-                sims = self.addr_matrices[c].dot(q_vec.T).toarray().ravel()
-                top_idx = np.argsort(-sims, kind='stable')[:k]
-                for idx in top_idx:
-                    score = float(sims[idx])
-                    if score > 0.25:
-                        tid = tids[idx]
-                        evidence[tid]["tfidf_addr"] = score
-                        if len(cand_set) < self.max_total_candidates:
-                            cand_set.add(tid)
+                sims = q_vec.dot(self.addr_matrices[c])
+                for idx, score in _extract_sparse_topk(sims, k, 0.25):
+                    tid = tids[idx]
+                    evidence[tid]["tfidf_addr"] = score
+                    if len(cand_set) < self.max_total_candidates:
+                        cand_set.add(tid)
                             
         # 3. Char 3-gram TF-IDF Top-K
         if self.enable_tfidf_char and c in self.char_vectorizers and n_name:
             v_char = self.char_vectorizers[c]
             q_vec = v_char.transform([n_name])
             if q_vec.nnz > 0:
-                sims = self.char_matrices[c].dot(q_vec.T).toarray().ravel()
-                top_idx = np.argsort(-sims, kind='stable')[:k]
-                for idx in top_idx:
-                    score = float(sims[idx])
-                    if score > 0.30:
-                        tid = tids[idx]
-                        evidence[tid]["tfidf_char"] = score
-                        if len(cand_set) < self.max_total_candidates:
-                            cand_set.add(tid)
+                sims = q_vec.dot(self.char_matrices[c])
+                for idx, score in _extract_sparse_topk(sims, k, 0.30):
+                    tid = tids[idx]
+                    evidence[tid]["tfidf_char"] = score
+                    if len(cand_set) < self.max_total_candidates:
+                        cand_set.add(tid)
                             
         return cand_set, evidence
 
@@ -150,7 +160,7 @@ class MultiViewCandidateRetriever:
         s1_by_country: Dict[str, List[Tuple[str, str, str, str, str]]],
         blocking_cands_map: Dict[str, Set[str]],
     ) -> Tuple[Dict[str, Set[str]], Dict[str, Dict[str, Dict[str, float]]]]:
-        """Bounded-memory country-sharded candidate retriever using sparse matrix-vector operations."""
+        """Bounded-memory country-sharded candidate retriever using fast sparse matrix operations."""
         final_cands: Dict[str, Set[str]] = {}
         evidence_map: Dict[str, Dict[str, Dict[str, float]]] = defaultdict(lambda: defaultdict(dict))
 
@@ -192,42 +202,33 @@ class MultiViewCandidateRetriever:
                 if has_name and rn:
                     q_vec = v_name.transform([rn])
                     if q_vec.nnz > 0:
-                        sims = M_name.dot(q_vec.T).toarray().ravel()
-                        top_idx = np.argsort(-sims, kind='stable')[:k]
-                        for idx in top_idx:
-                            score = float(sims[idx])
-                            if score > 0.15:
-                                tid = tids[idx]
-                                evidence_map[sid][tid]["tfidf_name"] = score
-                                if len(cand_set) < self.max_total_candidates:
-                                    cand_set.add(tid)
+                        sims = q_vec.dot(M_name)
+                        for idx, score in _extract_sparse_topk(sims, k, 0.15):
+                            tid = tids[idx]
+                            evidence_map[sid][tid]["tfidf_name"] = score
+                            if len(cand_set) < self.max_total_candidates:
+                                cand_set.add(tid)
 
                 # 2. Address TF-IDF Top-K
                 if has_addr and ra:
                     q_vec = v_addr.transform([ra])
                     if q_vec.nnz > 0:
-                        sims = M_addr.dot(q_vec.T).toarray().ravel()
-                        top_idx = np.argsort(-sims, kind='stable')[:k]
-                        for idx in top_idx:
-                            score = float(sims[idx])
-                            if score > 0.25:
-                                tid = tids[idx]
-                                evidence_map[sid][tid]["tfidf_addr"] = score
-                                if len(cand_set) < self.max_total_candidates:
-                                    cand_set.add(tid)
+                        sims = q_vec.dot(M_addr)
+                        for idx, score in _extract_sparse_topk(sims, k, 0.25):
+                            tid = tids[idx]
+                            evidence_map[sid][tid]["tfidf_addr"] = score
+                            if len(cand_set) < self.max_total_candidates:
+                                cand_set.add(tid)
 
                 # 3. Char 3-gram TF-IDF Top-K
                 if has_char and rn:
                     q_vec = v_char.transform([rn])
                     if q_vec.nnz > 0:
-                        sims = M_char.dot(q_vec.T).toarray().ravel()
-                        top_idx = np.argsort(-sims, kind='stable')[:k]
-                        for idx in top_idx:
-                            score = float(sims[idx])
-                            if score > 0.30:
-                                tid = tids[idx]
-                                evidence_map[sid][tid]["tfidf_char"] = score
-                                if len(cand_set) < self.max_total_candidates:
-                                    cand_set.add(tid)
+                        sims = q_vec.dot(M_char)
+                        for idx, score in _extract_sparse_topk(sims, k, 0.30):
+                            tid = tids[idx]
+                            evidence_map[sid][tid]["tfidf_char"] = score
+                            if len(cand_set) < self.max_total_candidates:
+                                cand_set.add(tid)
 
         return final_cands, evidence_map
